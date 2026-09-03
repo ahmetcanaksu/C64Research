@@ -1,0 +1,20 @@
+[package]
+name = "emu"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Windowed C64 emulator: boots the real KERNAL/BASIC and renders the VIC-II via minifb."
+
+[dependencies]
+c64 = { path = "../../crates/c64" }
+vic2 = { path = "../../crates/vic2" }
+sid = { path = "../../crates/sid" }
+d64 = { path = "../../crates/d64" }
+c64-kernal = { path = "../../crates/kernal" }
+minifb = "0.28"
+cpal = "0.15"
+arboard = "3"
+
+[[bin]]
+name = "emu"
+path = "src/main.rs"

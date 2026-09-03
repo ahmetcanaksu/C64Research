@@ -1,0 +1,12 @@
+/target
+Cargo.lock
+/test-data
+/roms/kernal-*.bin
+/roms/basic-*.bin
+/roms/chargen-*.bin
+/kernal.asm
+/c1541.asm
+/*.asm
+/prg
+*.ppm
+*.png

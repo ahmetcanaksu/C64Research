@@ -1,0 +1,8 @@
+[package]
+name = "d64"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Reader for .d64 Commodore 1541 disk images — directory listing and file extraction."
+
+[dependencies]

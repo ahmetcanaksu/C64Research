@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mos6502",
+    "crates/via6522",
+    "crates/cia6526",
+    "crates/vic2",
+    "crates/sid",
+    "crates/d64",
+    "crates/c1541",
+    "crates/c64",
+    "crates/kernal",
+    "apps/disasm",
+    "apps/emu",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+# Optimize release builds hard — matters later when the emulator runs at speed.
+[profile.release]
+lto = true
+codegen-units = 1

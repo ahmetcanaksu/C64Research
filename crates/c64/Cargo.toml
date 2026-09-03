@@ -1,0 +1,12 @@
+[package]
+name = "c64"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "A Commodore 64 machine: 6510 + PLA banking + RAM + ROMs + 2 CIAs + VIC-II."
+
+[dependencies]
+mos6502 = { path = "../mos6502" }
+cia6526 = { path = "../cia6526" }
+vic2 = { path = "../vic2" }
+sid = { path = "../sid" }

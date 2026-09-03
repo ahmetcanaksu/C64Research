@@ -1,0 +1,8 @@
+[package]
+name = "cia6526"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "MOS 6526 CIA (Complex Interface Adapter) — the C64's keyboard/timer/IRQ chip."
+
+[dependencies]
