@@ -37,6 +37,15 @@ const SPECIAL_KEYS: &[(Key, u8, bool)] = &[
     (Key::Left, 2, true),    // CRSR left = SHIFT + CRSR right
     (Key::Home, 51, false),  // HOME  (SHIFT+Home would be CLR)
     (Key::Delete, 0, false), // INST/DEL
+    // Function keys: F1/F3/F5/F7 are unshifted; F2/F4/F6/F8 are their shifts.
+    (Key::F1, 4, false),
+    (Key::F2, 4, true),
+    (Key::F3, 5, false),
+    (Key::F4, 5, true),
+    (Key::F5, 6, false),
+    (Key::F6, 6, true),
+    (Key::F7, 3, false),
+    (Key::F8, 3, true),
 ];
 
 type SharedBuf = Arc<Mutex<VecDeque<f32>>>;
@@ -93,7 +102,7 @@ fn main() -> ExitCode {
         "  paste     : {}",
         if clipboard.is_some() { "Ctrl+V pastes clipboard text into the C64" } else { "unavailable" }
     );
-    println!("  edit keys : arrows = cursor, Home = HOME, Del/Backspace = DEL");
+    println!("  edit keys : arrows = cursor, Home = HOME, Del/Backspace = DEL, F1-F8 = C64 F-keys");
     println!("  break     : Ctrl+C = RUN/STOP    RESTORE = PageUp (Ctrl+C+PageUp = warm reset)");
     println!("  quit      : Esc\n");
 
