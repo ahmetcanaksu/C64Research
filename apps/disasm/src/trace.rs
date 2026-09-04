@@ -122,16 +122,13 @@ pub fn disassemble_trace(
 
             // Record control-flow targets and decide whether to fall through.
             let mut fallthrough = true;
-            match mode {
-                AddrMode::Rel => {
-                    // Conditional branch: queue the target, keep falling through.
-                    let t = branch_target(pc, bytes[1]);
-                    labels.insert(t);
-                    if to_off(t).is_some() {
-                        work.push(t);
-                    }
+            if mode == AddrMode::Rel {
+                // Conditional branch: queue the target, keep falling through.
+                let t = branch_target(pc, bytes[1]);
+                labels.insert(t);
+                if to_off(t).is_some() {
+                    work.push(t);
                 }
-                _ => {}
             }
             if m == "JMP" {
                 if mode == AddrMode::Abs {

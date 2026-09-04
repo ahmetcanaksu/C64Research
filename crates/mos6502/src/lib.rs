@@ -69,6 +69,10 @@ impl Op {
     }
 
     /// Total instruction length in bytes (opcode + operand).
+    ///
+    /// Not a collection length — an opcode is never "empty" — so there is
+    /// deliberately no `is_empty` to go with it.
+    #[allow(clippy::len_without_is_empty)]
     pub const fn len(&self) -> u8 {
         instr_len(self.mode)
     }

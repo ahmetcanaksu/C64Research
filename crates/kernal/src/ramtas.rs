@@ -70,7 +70,10 @@ pub fn ramtas(m: &mut C64Mem) -> u16 {
     m.w(0x00B3, 0x03);
 
     // Walk RAM from $0400 upward, non-destructively testing each byte.
-    let top = 'scan: loop {
+    //
+    // A labelled *block* rather than a labelled loop: the scan runs once and
+    // leaves by `break 'scan` with the answer, so there is nothing to repeat.
+    let top = 'scan: {
         let mut addr: u16 = 0x0400;
         loop {
             let original = m.r(addr);

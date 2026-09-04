@@ -378,7 +378,7 @@ impl Cpu {
             "RTS" => {
                 let lo = self.pull(bus) as u16;
                 let hi = self.pull(bus) as u16;
-                self.pc = ((lo | (hi << 8)).wrapping_add(1)) as u16;
+                self.pc = (lo | (hi << 8)).wrapping_add(1);
                 6
             }
             "RTI" => {
