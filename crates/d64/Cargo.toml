@@ -6,3 +6,8 @@ license.workspace = true
 description = "Reader for .d64 Commodore 1541 disk images — directory listing and file extraction."
 
 [dependencies]
+iec = { path = "../iec" }
+
+[[example]]
+name = "make-test-disk"
+path = "examples/make_test_disk.rs"

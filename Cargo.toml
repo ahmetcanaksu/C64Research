@@ -7,9 +7,11 @@ members = [
     "crates/vic2",
     "crates/sid",
     "crates/d64",
+    "crates/iec",
     "crates/c1541",
     "crates/c64",
     "crates/kernal",
+    "crates/harness",
     "apps/disasm",
     "apps/emu",
 ]

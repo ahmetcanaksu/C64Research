@@ -14,6 +14,8 @@ c64-kernal = { path = "../../crates/kernal" }
 minifb = "0.28"
 cpal = "0.15"
 arboard = "3"
+iec = { path = "../../crates/iec" }
+harness = { path = "../../crates/harness" }
 
 [[bin]]
 name = "emu"

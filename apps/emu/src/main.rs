@@ -9,34 +9,35 @@
 //! Run from the workspace root:  cargo run -p emu --release
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::process::ExitCode;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use c64::C64;
+use harness::keyboard::{self, Typist, RUN_STOP_KEY, SHIFT_KEY};
+use harness::{screen, Drive, CYCLES_PER_FRAME};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use minifb::{InputCallback, Key, KeyRepeat, Scale, ScaleMode, Window, WindowOptions};
 use vic2::{HEIGHT, WIDTH};
 
-/// PAL C64: ~985 kHz / 50 Hz ≈ 19700 CPU cycles per frame.
-const CYCLES_PER_FRAME: u32 = 19_700;
-/// SHIFT's key in the C64 matrix.
-const SHIFT_KEY: u8 = 15;
-/// RUN/STOP's key in the C64 matrix (matrix code 63) — breaks a running program.
-const RUN_STOP_KEY: u8 = 63;
 
 /// Host key -> (C64 matrix code, needs SHIFT) for keys the host doesn't deliver
 /// as characters. The C64 makes cursor-up/left the *shifted* forms of
 /// cursor-down/right, and CLR the shifted form of HOME.
 const SPECIAL_KEYS: &[(Key, u8, bool)] = &[
-    (Key::Down, 7, false),   // CRSR down
-    (Key::Up, 7, true),      // CRSR up   = SHIFT + CRSR down
-    (Key::Right, 2, false),  // CRSR right
-    (Key::Left, 2, true),    // CRSR left = SHIFT + CRSR right
-    (Key::Home, 51, false),  // HOME  (SHIFT+Home would be CLR)
-    (Key::Delete, 0, false), // INST/DEL
+    (Key::Down, 7, false),  // CRSR down
+    (Key::Up, 7, true),     // CRSR up   = SHIFT + CRSR down
+    (Key::Right, 2, false), // CRSR right
+    (Key::Left, 2, true),   // CRSR left = SHIFT + CRSR right
+    (Key::Home, 51, false), // HOME  (SHIFT+Home would be CLR)
+    // DEL comes through here rather than as a character, because whether a
+    // control code arrives as a character at all is platform-dependent — see
+    // `CharCollector::add_char`. Holding it *should* repeat: INST/DEL is one of
+    // the few keys the KERNAL repeats by default.
+    (Key::Backspace, 0, false), // INST/DEL — the Mac's main delete key
+    (Key::Delete, 0, false),    // INST/DEL — forward delete (fn+Delete)
     // Function keys: F1/F3/F5/F7 are unshifted; F2/F4/F6/F8 are their shifts.
     (Key::F1, 4, false),
     (Key::F2, 4, true),
@@ -47,6 +48,21 @@ const SPECIAL_KEYS: &[(Key, u8, bool)] = &[
     (Key::F7, 3, false),
     (Key::F8, 3, true),
 ];
+
+/// Host keys that mean RETURN.
+///
+/// These are **edge**-triggered in the frame loop, not held like
+/// [`SPECIAL_KEYS`], and they are delivered through the type-ahead queue so
+/// they get the same press/release discipline as a typed character.
+///
+/// The distinction matters more than it looks. A held RETURN injects a keypress
+/// on every frame it is down, which is fine when you are typing by hand and
+/// disastrous when characters are already queued: the stray RETURN submits the
+/// line half-typed. Do that to `LOAD"*",8,1` and the C64 runs a bare `LOAD`,
+/// which defaults to device 1 — so the machine asks you to PRESS PLAY ON TAPE
+/// and never speaks to the disk. The C64 does not repeat RETURN anyway, so
+/// there is nothing to lose.
+const RETURN_KEYS: &[Key] = &[Key::Enter, Key::NumPadEnter];
 
 type SharedBuf = Arc<Mutex<VecDeque<f32>>>;
 
@@ -81,7 +97,7 @@ fn main() -> ExitCode {
     let cycles_per_sample = audio.as_ref().map(|(_, sr)| sid::CLOCK_PAL as f32 / *sr as f32);
 
     // ---- keyboard translation ----
-    let char_map = build_char_map();
+    let char_map = keyboard::char_map();
     let type_queue: Rc<RefCell<VecDeque<char>>> = Rc::new(RefCell::new(VecDeque::new()));
 
     // ---- info log ----
@@ -100,33 +116,171 @@ fn main() -> ExitCode {
     let mut clipboard = arboard::Clipboard::new().ok();
     println!(
         "  paste     : {}",
-        if clipboard.is_some() { "Ctrl+V pastes clipboard text into the C64" } else { "unavailable" }
+        if clipboard.is_some() {
+            "Ctrl+V (or Cmd+V) pastes clipboard text into the C64"
+        } else {
+            "unavailable"
+        }
     );
-    println!("  edit keys : arrows = cursor, Home = HOME, Del/Backspace = DEL, F1-F8 = C64 F-keys");
+    println!(
+        "  edit keys : Return, arrows = cursor, Home = HOME, Del/Backspace = DEL, F1-F8 = C64 F-keys"
+    );
     println!("  break     : Ctrl+C = RUN/STOP    RESTORE = PageUp (Ctrl+C+PageUp = warm reset)");
     println!("  quit      : Esc\n");
 
-    // Optional program to load:  cargo run -p emu -- <file.prg|file.d64> [name]
-    let mut cli = std::env::args().skip(1);
-    if let Some(path) = cli.next() {
-        let name = cli.next();
-        match load_program_file(&path, name.as_deref()) {
-            Ok(prg) => {
-                let size = prg.len();
-                run_until_ready(&mut c64); // boot before injecting
-                let addr = c64.load_prg(&prg);
-                println!("  loaded    : {path} -> ${addr:04X} ({size} bytes)");
-                if addr == 0x0801 {
-                    for ch in "run\r".chars() {
-                        type_queue.borrow_mut().push_back(ch);
+    // Optional program or disk:
+    //   cargo run -p emu -- <file.prg>                  side-load a raw PRG
+    //   cargo run -p emu -- <file.d64> [name]           attach a drive on the bus
+    //   cargo run -p emu -- <file.d64> [name] --sideload  skip the bus, inject
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let sideload = args.iter().any(|a| a == "--sideload");
+    let positional: Vec<&str> =
+        args.iter().filter(|a| !a.starts_with("--")).map(String::as_str).collect();
+
+    // A drive on the serial bus, if we attach one. Declared out here because the
+    // frame loop below has to clock it alongside the CPU.
+    let mut drive: Option<Drive> = None;
+
+    if let Some(&path) = positional.first() {
+        let name = positional.get(1).copied();
+        let lower = path.to_ascii_lowercase();
+        let is_disk = lower.ends_with(".d64");
+        let is_cart = lower.ends_with(".bin") || lower.ends_with(".rom") || sideload_cart(&args);
+        let no_autoload = args.iter().any(|a| a == "--no-autoload");
+
+        if is_cart {
+            // A cartridge is not loaded into the machine, it *is* part of the
+            // machine: plugged into the expansion port, then reset so the
+            // KERNAL's `$FD02` check can find it and hand over.
+            match std::fs::read(path) {
+                Ok(rom) => {
+                    let cart = if rom.len() > 0x2000 {
+                        c64::Cartridge::hi16k(&rom)
+                    } else {
+                        c64::Cartridge::lo8k(&rom)
+                    };
+                    let autostart = cart.is_autostart();
+                    let kind = if rom.len() > 0x2000 { "16K ($8000+$A000)" } else { "8K ($8000)" };
+                    c64.insert_cartridge(cart);
+                    println!("  cartridge : {path} — {kind}, {} bytes", rom.len());
+                    println!(
+                        "  autostart : {}\n",
+                        if autostart {
+                            "CBM80 found — the cartridge takes over at reset"
+                        } else {
+                            "no CBM80 signature — BASIC will boot, with less RAM"
+                        }
+                    );
+                }
+                Err(e) => eprintln!("  cart error : cannot read {path}: {e}\n"),
+            }
+        } else if is_disk && !sideload {
+            // The real thing: put the disk in a drive, hang the drive off the
+            // serial bus, and let the KERNAL fetch the file itself. Slow, the way
+            // a 1541 is slow — every byte crosses three wires a bit at a time.
+            match std::fs::read(path)
+                .map_err(|e| format!("cannot read {path}: {e}"))
+                .and_then(|b| d64::Disk::new(b).ok_or_else(|| "not a valid .d64 image".into()))
+            {
+                Ok(disk) => {
+                    // Peek at the load address host-side, purely so we can print
+                    // the right hint (RUN for BASIC, SYS for machine code).
+                    let want = name.unwrap_or("*");
+                    let start = disk
+                        .read_prg(want)
+                        .filter(|p| p.len() >= 2)
+                        .map(|p| u16::from_le_bytes([p[0], p[1]]));
+
+                    let mut attached = Drive::new(disk);
+                    println!("  drive     : device 8 on the serial bus <- {path}");
+                    run_until_ready(&mut c64, Some(&mut attached));
+
+                    if !no_autoload {
+                        for ch in format!("load\"{want}\",8,1\r").chars() {
+                            type_queue.borrow_mut().push_back(ch);
+                        }
                     }
-                    println!("  autostart : RUN\n");
-                } else {
-                    println!("  note      : loaded at ${addr:04X}; a machine-code program — SYS {addr} to start\n");
+                    drive = Some(attached);
+
+                    if no_autoload {
+                        println!("  ready     : drive attached, nothing typed\n");
+                    }
+                    match start {
+                        _ if no_autoload => {}
+                        Some(0x0801) => println!("  loading   : LOAD\"{want}\",8,1  — then type RUN\n"),
+                        Some(addr) => {
+                            println!("  loading   : LOAD\"{want}\",8,1  — then SYS {addr} to start\n")
+                        }
+                        None => println!("  loading   : LOAD\"{want}\",8,1\n"),
+                    }
+                }
+                Err(e) => eprintln!("  disk error : {e}\n"),
+            }
+        } else {
+            // Side-load: copy the bytes straight into RAM. No bus involved, so
+            // it is instant — handy when you want the program, not the protocol.
+            match load_program_file(path, name) {
+                Ok(prg) => {
+                    let size = prg.len();
+                    run_until_ready(&mut c64, None); // boot before injecting
+                    let addr = c64.load_prg(&prg);
+                    println!("  loaded    : {path} -> ${addr:04X} ({size} bytes, side-loaded)");
+                    if addr == 0x0801 {
+                        for ch in "run\r".chars() {
+                            type_queue.borrow_mut().push_back(ch);
+                        }
+                        println!("  autostart : RUN\n");
+                    } else {
+                        println!("  note      : loaded at ${addr:04X}; a machine-code program — SYS {addr} to start\n");
+                    }
+                }
+                Err(e) => eprintln!("  load error : {e}\n"),
+            }
+        }
+    }
+
+    // ---- headless script mode -------------------------------------------
+    // No window, no audio: type something, run, print the screen as text. This
+    // is how the keyboard and loading paths get exercised from a terminal (and
+    // from CI), which matters because "a character went missing" is invisible
+    // until you can see the line the C64 actually ended up with.
+    if args.iter().any(|a| a == "--headless") {
+        let extra = args.iter().find_map(|a| a.strip_prefix("--type="));
+        let frames: u32 = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--frames="))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(600);
+
+        if drive.is_none() {
+            // Nothing queued a boot yet, so do it here.
+            run_until_ready(&mut c64, None);
+        }
+        if let Some(text) = extra {
+            let mut q = type_queue.borrow_mut();
+            for ch in unescape(text).chars() {
+                q.push_back(ch);
+            }
+        }
+
+        let mut typist = Typist::default();
+        for _ in 0..frames {
+            c64.board.key_matrix = [0; 8];
+            typist.frame(&mut c64, &mut type_queue.borrow_mut(), &char_map);
+            let deadline = c64.cpu.cycles.wrapping_add(CYCLES_PER_FRAME as u64);
+            while c64.cpu.cycles < deadline {
+                let cycles = c64.step();
+                if let Some(d) = drive.as_mut() {
+                    d.tick(&mut c64.board.iec, cycles as u32);
                 }
             }
-            Err(e) => eprintln!("  load error : {e}\n"),
         }
+
+        println!("--- screen ---\n{}\n--- end ---", screen::text(&c64.board.ram));
+        if typist.busy() || !type_queue.borrow().is_empty() {
+            eprintln!("note: still typing when the frame budget ran out; raise --frames");
+        }
+        return ExitCode::SUCCESS;
     }
 
     let mut window = match Window::new(
@@ -147,17 +301,27 @@ fn main() -> ExitCode {
         }
     };
     window.set_target_fps(50);
-    window.set_input_callback(Box::new(CharCollector { queue: type_queue.clone() }));
+    let debug_keys = args.iter().any(|a| a == "--debug-keys");
+    if debug_keys {
+        println!("  debug     : logging every character the host delivers\n");
+    }
+    window.set_input_callback(Box::new(CharCollector {
+        queue: type_queue.clone(),
+        debug: debug_keys,
+    }));
 
     // One typed character is held down for a couple of frames (so the KERNAL's
     // 60 Hz keyboard scan catches it) then released for a gap frame.
-    let mut hold: Option<(u8, bool, u8)> = None;
-    let mut gap = 0u8;
+    let mut typist = Typist::default();
     let mut sample_carry = 0.0f32;
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
-        // Ctrl+V: push the clipboard text into the type-ahead queue.
-        let ctrl = window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl);
+        // Paste the clipboard into the type-ahead queue. Ctrl+V everywhere, and
+        // Cmd+V too, because that is the shortcut a Mac user will actually press.
+        let ctrl = window.is_key_down(Key::LeftCtrl)
+            || window.is_key_down(Key::RightCtrl)
+            || window.is_key_down(Key::LeftSuper)
+            || window.is_key_down(Key::RightSuper);
         if ctrl && window.is_key_pressed(Key::V, KeyRepeat::No) {
             if let Some(cb) = clipboard.as_mut() {
                 if let Ok(text) = cb.get_text() {
@@ -169,30 +333,16 @@ fn main() -> ExitCode {
             }
         }
 
+        // RETURN: one queued '\r' per physical press. Going through the queue
+        // (rather than holding the key) keeps it from interleaving with
+        // characters that are still being typed.
+        if RETURN_KEYS.iter().any(|&k| window.is_key_pressed(k, KeyRepeat::No)) {
+            type_queue.borrow_mut().push_back('\r');
+        }
+
         // Drive the keyboard matrix from the injection state machine.
         c64.board.key_matrix = [0; 8];
-        if let Some((code, shift, left)) = hold {
-            c64.board.set_key(code, true);
-            if shift {
-                c64.board.set_key(SHIFT_KEY, true);
-            }
-            hold = if left > 1 {
-                Some((code, shift, left - 1))
-            } else {
-                gap = 1;
-                None
-            };
-        } else if gap > 0 {
-            gap -= 1;
-        } else if let Some(c) = type_queue.borrow_mut().pop_front() {
-            if let Some(&(code, shift)) = char_map.get(&c) {
-                c64.board.set_key(code, true);
-                if shift {
-                    c64.board.set_key(SHIFT_KEY, true);
-                }
-                hold = Some((code, shift, 1));
-            }
-        }
+        typist.frame(&mut c64, &mut type_queue.borrow_mut(), &char_map);
 
         // Ctrl+C, held, presses RUN/STOP — the C64 way to break a running
         // program (BASIC prints "BREAK"). Applied live, on top of any typing.
@@ -231,6 +381,9 @@ fn main() -> ExitCode {
                 rendered[line] = true;
             }
             let c = c64.step();
+            if let Some(d) = drive.as_mut() {
+                d.tick(&mut c64.board.iec, c as u32);
+            }
             if let Some(cps) = cycles_per_sample {
                 sample_carry += c as f32;
                 while sample_carry >= cps {
@@ -240,8 +393,8 @@ fn main() -> ExitCode {
             }
         }
         // Any scanline the raster didn't reach this pass: render with final state.
-        for y in 0..HEIGHT {
-            if !rendered[y] {
+        for (y, drawn) in rendered.iter().enumerate() {
+            if !drawn {
                 let cia2 = c64.board.cia2_pra();
                 c64.board
                     .vic
@@ -268,9 +421,37 @@ fn main() -> ExitCode {
 /// Collects the Unicode characters the host types (respecting its layout).
 struct CharCollector {
     queue: Rc<RefCell<VecDeque<char>>>,
+    /// `--debug-keys`: log every code point the host delivers.
+    ///
+    /// Worth having permanently. When a key "does nothing" the cause is one of
+    /// three things — the host sent no character at all, it sent a character
+    /// this build filters out, or it sent one the C64 has no key for — and they
+    /// need completely different fixes. Guessing between them from a
+    /// description is hopeless; seeing the code point settles it at once.
+    debug: bool,
 }
+
 impl InputCallback for CharCollector {
     fn add_char(&mut self, uni_char: u32) {
+        if self.debug {
+            let shown = char::from_u32(uni_char).unwrap_or('?');
+            eprintln!(
+                "  key       : U+{uni_char:04X} {shown:?}{}",
+                if keyboard::is_printable(uni_char) { "" } else { "  (control code — handled as a key)" }
+            );
+        }
+        // Only *printable* characters travel this path. Control codes are
+        // handled as keys instead ([`SPECIAL_KEYS`]), because the backends
+        // disagree about whether they arrive here at all: minifb's macOS
+        // backend drops every code point below 32 (and 127..160) before the
+        // callback, while the Windows one passes them straight through. That is
+        // why RETURN worked on Windows and did nothing on a Mac.
+        //
+        // Filtering here rather than compensating per-platform keeps one code
+        // path: control keys are always keys, everywhere.
+        if !keyboard::is_printable(uni_char) {
+            return;
+        }
         if let Some(c) = char::from_u32(uni_char) {
             self.queue.borrow_mut().push_back(c);
         }
@@ -293,47 +474,48 @@ fn load_program_file(path: &str, name: Option<&str>) -> Result<Vec<u8>, String> 
 
 /// Step the machine until the KERNAL prints READY. (so an injected program lands
 /// at the BASIC prompt). Bounded so a bad ROM can't hang forever.
-fn run_until_ready(c64: &mut c64::C64) {
+fn run_until_ready(c64: &mut c64::C64, mut drive: Option<&mut Drive>) {
     const READY: [u8; 5] = [0x12, 0x05, 0x01, 0x04, 0x19];
     for i in 0..40_000_000u64 {
-        c64.step();
+        let cycles = c64.step();
+        if let Some(d) = drive.as_deref_mut() {
+            d.tick(&mut c64.board.iec, cycles as u32);
+        }
         if i % 100_000 == 0 && c64.board.ram[0x0400..0x07E8].windows(5).any(|w| w == READY) {
             return;
         }
     }
 }
 
-/// PETSCII byte -> ASCII-range char (the two coincide over $20..=$5F).
-fn petscii_char(b: u8) -> Option<char> {
-    match b {
-        0x20..=0x5F => Some(b as char),
-        _ => None,
-    }
+/// Was `--cart` passed? Lets an image with any extension be treated as one.
+fn sideload_cart(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--cart")
 }
 
-/// Build a character -> (C64 matrix code, needs-shift) map straight from the
-/// KERNAL's own keyboard decode tables, so the mapping is exactly the C64's.
-fn build_char_map() -> HashMap<char, (u8, bool)> {
-    use kernal::irq::{SHIFTED_KEYS, UNSHIFTED_KEYS};
-    let mut m = HashMap::new();
-    for idx in 0..64usize {
-        if let Some(ch) = petscii_char(UNSHIFTED_KEYS[idx]) {
-            m.entry(ch).or_insert((idx as u8, false));
-            if ch.is_ascii_uppercase() {
-                m.entry(ch.to_ascii_lowercase()).or_insert((idx as u8, false));
-            }
+/// Turn `\r` / `\n` / `\\` in a command-line string into real characters, so a
+/// shell can ask for a RETURN.
+fn unescape(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
         }
-        if let Some(ch) = petscii_char(SHIFTED_KEYS[idx]) {
-            m.entry(ch).or_insert((idx as u8, true));
+        match chars.next() {
+            Some('r') => out.push('\r'),
+            Some('n') => out.push('\n'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
         }
     }
-    // Non-printing keys the host still sends as characters.
-    m.insert('\r', (1, false)); // RETURN
-    m.insert('\n', (1, false));
-    m.insert('\u{8}', (0, false)); // Backspace -> DEL
-    m.insert('\u{7f}', (0, false));
-    m
+    out
 }
+
 
 /// Open the default audio output and start streaming from `buf`. Returns the
 /// live stream (keep it alive) and the sample rate, or `None` if unavailable.
@@ -380,4 +562,43 @@ where
             None,
         )
         .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The host-key bindings, which are the only keyboard concern left in this
+    /// binary — the character mapping, the typing discipline and the end-to-end
+    /// load tests all live in `crates/harness`.
+    #[test]
+    fn return_is_edge_triggered_and_delete_is_held() {
+        let held =
+            |k: Key| SPECIAL_KEYS.iter().find(|&&(key, _, _)| key == k).map(|&(_, c, s)| (c, s));
+
+        // A Mac's main delete key is Backspace; fn+Delete is Delete. Both are the
+        // C64's single INST/DEL, and both are *held* so they repeat — INST/DEL is
+        // one of the few keys the KERNAL repeats by default.
+        assert_eq!(held(Key::Backspace), Some((0, false)), "INST/DEL (backspace)");
+        assert_eq!(held(Key::Delete), Some((0, false)), "INST/DEL (forward delete)");
+
+        // RETURN must NOT be held: a held RETURN fires on every frame it is down
+        // and would submit a line that is still being typed.
+        assert!(RETURN_KEYS.contains(&Key::Enter), "RETURN must be bound");
+        assert!(RETURN_KEYS.contains(&Key::NumPadEnter), "keypad RETURN must be bound");
+        for k in RETURN_KEYS {
+            assert_eq!(held(*k), None, "{k:?} must not also be a held key");
+        }
+    }
+
+    /// `--type` has to be able to ask for a RETURN from a shell.
+    #[test]
+    fn unescapes_command_line_escapes() {
+        assert_eq!(unescape(r"run\r"), "run\r");
+        assert_eq!(unescape(r"a\nb"), "a\nb");
+        assert_eq!(unescape(r"back\\slash"), r"back\slash");
+        assert_eq!(unescape("plain"), "plain");
+        // An unknown escape is left alone rather than eaten.
+        assert_eq!(unescape(r"\q"), r"\q");
+    }
 }

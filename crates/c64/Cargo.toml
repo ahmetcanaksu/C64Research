@@ -10,3 +10,5 @@ mos6502 = { path = "../mos6502" }
 cia6526 = { path = "../cia6526" }
 vic2 = { path = "../vic2" }
 sid = { path = "../sid" }
+iec = { path = "../iec" }
+

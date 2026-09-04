@@ -119,6 +119,20 @@ pub fn ioinit(m: &mut C64Mem) {
     m.w(0xDC0D, 0x81);
     let cra = (m.r(0xDC0E) & 0x80) | 0x11;
     m.w(0xDC0E, cra);
+
+    // ...and IOINIT's very last act, easy to miss because it is a `JMP` and not
+    // a `JSR`:
+    //
+    //   FF7D:  4C 8E EE  JMP  LEE8E        ; CLKLO — and RTS straight back to RESET
+    //
+    // `$EE8E` is CLKLO: `LDA $DD00; ORA #$10; STA $DD00`. Bit 4 is the serial
+    // CLK *output*, and the board's 7406 buffer inverts it, so setting the bit
+    // pulls CLK to ground. The C64 therefore sits with the serial clock line
+    // **low** from power-on onwards — ATN and DATA released, CLK held. A drive
+    // waits on ATN, not CLK, so this costs nothing and it is what the KERNAL's
+    // own send routines expect to find when they start a transfer.
+    let dd00 = m.r(0xDD00);
+    m.w(0xDD00, dd00 | 0x10);
 }
 
 /// Copy the VIC-II power-on register table to $D000-$D02E ($E5A0). Also sets the
@@ -251,6 +265,27 @@ mod tests {
         assert_eq!(m.r(0x0400), 0x20); // top-left screen cell = space
         assert_eq!(m.r(0xD800), 0x0E); // color RAM = light blue
         assert_eq!(m.r(0x0286), 0x0E); // current text color
+    }
+
+    /// IOINIT's parting shot is `JMP $EE8E` (CLKLO), so a freshly booted C64
+    /// leaves the serial bus with **ATN and DATA released but CLK pulled low**.
+    ///
+    /// Remember the inversion: these are the *output* bits, and the 7406 buffers
+    /// between the CIA and the port invert them, so a `1` in the register means
+    /// "pull that line to ground".
+    #[test]
+    fn ioinit_leaves_the_serial_clock_pulled_low() {
+        let mut m = fresh();
+        ioinit(&mut m);
+
+        let dd00 = m.r(0xDD00);
+        assert_eq!(dd00 & 0x08, 0x00, "ATN out clear -> ATN released");
+        assert_eq!(dd00 & 0x10, 0x10, "CLK out set -> CLK pulled low");
+        assert_eq!(dd00 & 0x20, 0x00, "DATA out clear -> DATA released");
+        // The low three bits are untouched: VIC bank 0 + RS-232 TXD high.
+        assert_eq!(dd00 & 0x07, 0x07);
+        // Bits 0-5 outputs, 6-7 (CLK IN / DATA IN) inputs.
+        assert_eq!(m.r(0xDD02), 0x3F);
     }
 
     #[test]

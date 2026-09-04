@@ -1,0 +1,6 @@
+[package]
+name = "iec"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The Commodore serial (IEC) bus: three open-collector lines shared by the C64 and its drives"

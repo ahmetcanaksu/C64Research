@@ -9,6 +9,10 @@
 #![no_std]
 extern crate alloc;
 
+pub mod drive;
+
+pub use drive::{directory_listing, DiskDrive};
+
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -54,6 +58,17 @@ impl DirEntry {
     pub fn is_prg(&self) -> bool {
         self.file_type & 0x0F == 2
     }
+}
+
+/// A disk's identity as stored in its BAM sector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Header {
+    /// 16-byte PETSCII disk name, padded with `$A0`.
+    pub name: [u8; 16],
+    /// Two-character disk ID.
+    pub id: [u8; 2],
+    /// DOS type — `"2A"` for a 1541.
+    pub dos_type: [u8; 2],
 }
 
 /// A mounted `.d64` image.
@@ -125,6 +140,53 @@ impl Disk {
             .map(|e| self.read_entry(e))
     }
 
+    /// The disk's identity, from the BAM sector (track 18, sector 0).
+    ///
+    /// Unprintable bytes are replaced, because these go straight into the
+    /// synthesised BASIC program of a `$` listing where a `$00` would end the
+    /// line early and truncate the directory. *What* they are replaced with
+    /// differs between the fields, and the reason is a nice piece of BASIC
+    /// trivia:
+    ///
+    /// - The **name** is padded with `$A0`, the shifted space, exactly as a real
+    ///   drive pads it. That works because the name is printed inside quotes,
+    ///   and `LIST` does not detokenise inside a quoted string.
+    /// - The **ID** and **DOS type** sit *outside* the quotes, where `LIST` does
+    ///   detokenise — and `$A0` happens to be the token for `CLOSE`, so padding
+    ///   those with `$A0` makes a listing read `01 CLOSE`. They get spaces.
+    pub fn header(&self) -> Header {
+        let bam = self.sector(DIR_TRACK, 0);
+        let mut name = [0xA0u8; 16];
+        for (i, slot) in name.iter_mut().enumerate() {
+            let b = bam[0x90 + i];
+            *slot = if b < 0x20 { 0xA0 } else { b };
+        }
+        let outside_quotes = |b: u8| if (0x20..0x80).contains(&b) { b } else { b' ' };
+        Header {
+            name,
+            id: [outside_quotes(bam[0xA2]), outside_quotes(bam[0xA3])],
+            dos_type: [outside_quotes(bam[0xA5]), outside_quotes(bam[0xA6])],
+        }
+    }
+
+    /// Free blocks, summed from the BAM's per-track free counts.
+    ///
+    /// Track 18 is excluded, exactly as a real drive excludes it — the
+    /// directory track is not yours to fill, which is why a blank 1541 disk
+    /// reports 664 free and not 683.
+    pub fn blocks_free(&self) -> u16 {
+        let bam = self.sector(DIR_TRACK, 0);
+        let mut free = 0u16;
+        for track in 1..=35u8 {
+            if track == DIR_TRACK {
+                continue;
+            }
+            // Four bytes per track from offset 4; the first is the free count.
+            free += bam[4 + (track as usize - 1) * 4] as u16;
+        }
+        free
+    }
+
     fn read_chain(&self, mut track: u8, mut sector: u8) -> Vec<u8> {
         let mut out = Vec::new();
         for _ in 0..683 {
@@ -162,24 +224,94 @@ fn petscii_name(bytes: &[u8]) -> String {
     s
 }
 
-#[cfg(test)]
-mod tests {
+/// Synthetic disk images, for tests and experiments.
+///
+/// Hand-built images are how you test a disk format without shipping somebody's
+/// copyrighted disk: every byte here is one this crate's own parser has to
+/// understand, so a fixture doubles as documentation of the layout.
+pub mod fixtures {
     use super::*;
 
-    /// Build a tiny synthetic disk with one PRG file to exercise the parser.
-    fn synthetic_disk() -> Disk {
+    /// A tiny but valid image: one single-sector PRG named `HELLO`, holding the
+    /// load address `$0801` followed by three dummy bytes.
+    ///
+    /// Deliberately *not* a runnable program — it exists to be transferred and
+    /// compared byte-for-byte. If you want a disk that visibly does something,
+    /// use [`basic_program_image`].
+    pub fn synthetic_image() -> Vec<u8> {
+        image_with_prg(b"HELLO", &[0x01, 0x08, 0xAA, 0xBB, 0xCC])
+    }
+
+    /// A disk holding a **runnable** BASIC program — `10 PRINT"HELLO FROM DISK"`
+    /// — so that `LOAD"*",8,1` followed by `RUN` puts something on the screen.
+    ///
+    /// This is what a BASIC program looks like on disk, which is worth seeing
+    /// once: a two-byte load address, then per line a link to the next line, the
+    /// line number, the *tokenised* text (`PRINT` is the single byte `$99`), and
+    /// a `$00`; then `$0000` to finish. The link here points at `$0818`, the
+    /// address the following line would start at — which is why a BASIC program
+    /// is not relocatable without relinking, and why the KERNAL's relocating
+    /// load exists.
+    pub fn basic_program_image() -> Vec<u8> {
+        const TEXT: &[u8] = b"HELLO FROM DISK";
+        let mut prg = alloc::vec![0x01, 0x08]; // load address $0801
+        // Line 10 starts at $0801; the next line would start after this one.
+        let next_line = 0x0801u16 + 2 + 2 + 1 + 1 + TEXT.len() as u16 + 1 + 1;
+        prg.extend_from_slice(&next_line.to_le_bytes());
+        prg.extend_from_slice(&10u16.to_le_bytes()); // line number 10
+        prg.push(0x99); // PRINT
+        prg.push(b'"');
+        prg.extend_from_slice(TEXT);
+        prg.push(b'"');
+        prg.push(0x00); // end of line
+        prg.extend_from_slice(&[0x00, 0x00]); // end of program
+        image_with_prg(b"HELLO", &prg)
+    }
+
+    /// Build a `.d64` holding one PRG, named `name`, in a single sector.
+    ///
+    /// Panics if `prg` needs more than one sector (254 bytes) — these are
+    /// fixtures, not a disk writer.
+    pub fn image_with_prg(name: &[u8], prg: &[u8]) -> Vec<u8> {
+        assert!(prg.len() <= SECTOR_SIZE - 2, "fixture PRGs must fit one sector");
+        assert!(name.len() <= 16, "a CBM filename is at most 16 characters");
         let mut data = alloc::vec![0u8; track_offset(35) + SECTOR_SIZE * 17];
 
-        // Put a single-sector PRG on track 1: load addr $0801, then 3 data bytes.
-        // Sector (1,0) is the last sector; byte 1 = index of the last used byte.
+        // Put the PRG in sector (1,0). Byte 0 = next track (0 = this is the
+        // last sector), byte 1 = index of the last used byte in this sector.
         let s0 = sector_offset(1, 0);
-        data[s0] = 0; // no next track -> last sector
-        data[s0 + 1] = 6; // last used byte index (bytes 2..=6 are valid)
-        data[s0 + 2] = 0x01; // load lo ($0801)
-        data[s0 + 3] = 0x08; // load hi
-        data[s0 + 4] = 0xAA;
-        data[s0 + 5] = 0xBB;
-        data[s0 + 6] = 0xCC;
+        data[s0] = 0;
+        data[s0 + 1] = (prg.len() + 1) as u8;
+        data[s0 + 2..s0 + 2 + prg.len()].copy_from_slice(prg);
+
+        // Make track 18 sector 0 a believable BAM: a disk name, an ID, the
+        // DOS type a 1541 writes, and a per-track free count for every track
+        // but the directory track itself. Without this the image looks
+        // unformatted, and a `$` listing of it is misleading.
+        let bam = sector_offset(DIR_TRACK, 0);
+        data[bam] = DIR_TRACK; // first directory sector: 18/1
+        data[bam + 1] = DIR_SECTOR;
+        data[bam + 2] = b'A'; // DOS version
+        for track in 1..=35u8 {
+            let mut free = sectors_in_track(track);
+            if track == DIR_TRACK {
+                free = 0; // the directory track is not available
+            } else if track == 1 {
+                free -= 1; // the one sector our PRG occupies
+            }
+            data[bam + 4 + (track as usize - 1) * 4] = free;
+        }
+        let disk_name = b"TEST DISK";
+        for i in 0..16 {
+            data[bam + 0x90 + i] = disk_name.get(i).copied().unwrap_or(0xA0);
+        }
+        data[bam + 0xA0] = 0xA0;
+        data[bam + 0xA1] = 0xA0;
+        data[bam + 0xA2] = b'0'; // disk ID "01"
+        data[bam + 0xA3] = b'1';
+        data[bam + 0xA4] = 0xA0;
+        data[bam + 0xA5] = b'2'; // DOS type "2A"
+        data[bam + 0xA6] = b'A';
 
         // Directory entry on track 18 sector 1.
         let d = sector_offset(DIR_TRACK, DIR_SECTOR);
@@ -188,15 +320,23 @@ mod tests {
         data[d + 2] = 0x82; // closed PRG
         data[d + 3] = 1; // first track
         data[d + 4] = 0; // first sector
-        let name = b"HELLO";
         data[d + 5..d + 5 + name.len()].copy_from_slice(name);
-        for i in d + 5 + name.len()..d + 21 {
-            data[i] = 0xA0; // pad
-        }
+        data[d + 5 + name.len()..d + 21].fill(0xA0); // shifted-space padding
         data[d + 30] = 1; // size in sectors
 
-        Disk::new(data).unwrap()
+        data
     }
+
+    /// [`synthetic_image`], mounted.
+    pub fn synthetic_disk() -> Disk {
+        Disk::new(synthetic_image()).expect("the fixture is a valid image")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::synthetic_disk;
+    use super::*;
 
     #[test]
     fn lists_the_directory() {
