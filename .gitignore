@@ -10,3 +10,6 @@ Cargo.lock
 /prg
 *.ppm
 *.png
+# Generated test disks (see `cargo run -p d64 --example make-test-disk`)
+*.d64
+*.crt

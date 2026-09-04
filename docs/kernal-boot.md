@@ -74,6 +74,13 @@ clear (no match), so:
   `$8000`) runs, and the KERNAL boot never continues.
 - **no match** → normal boot proceeds.
 
+The machine can host one now (`c64::Cartridge`), which makes a nice thing
+visible: an 8 KB cartridge with a *broken* signature still boots BASIC, but the
+banner reads **30719** bytes free instead of 38911. Nobody coded that
+subtraction — RAMTAS (§4) writes its test pattern at `$8000`, reads cartridge ROM
+back instead, and concludes RAM ends there. The same write-hits-RAM/read-hits-ROM
+rule that finds the top of RAM also makes a cartridge cost you 8 KB of it.
+
 > Rust: `reset::cartridge_present`, `reset::CBM80`.
 
 ---
@@ -94,8 +101,22 @@ Brings all the I/O hardware to a known state and starts the heartbeat interrupt:
   from the `$02A6` flag) and started in continuous mode with its interrupt
   enabled. This is the **~60 Hz IRQ** that from now on drives the jiffy clock,
   the cursor, and the keyboard scan (see §9).
+- **The serial clock line**, and this one is easy to miss. IOINIT's last
+  instruction is a tail-call, not a subroutine call:
 
-> Rust: `reset::ioinit`.
+  ```
+  FF7D:  4C 8E EE  JMP  LEE8E        ; -> CLKLO, whose RTS returns to RESET
+  ```
+
+  `$EE8E` is CLKLO — `LDA $DD00; ORA #$10; STA $DD00`. Bit 4 is the serial
+  **CLK output**, and the 7406 buffer on the board inverts it, so setting the bit
+  pulls the line to **ground**. A C64 sitting at the `READY.` prompt is therefore
+  holding the serial clock line low, with ATN and DATA released. Nothing minds —
+  a drive waits on ATN, and the KERNAL's own send routines start by pulling CLK
+  low anyway — but it means "idle bus" does not mean "all three lines high".
+
+> Rust: `reset::ioinit`, and the test `ioinit_leaves_the_serial_clock_pulled_low`
+> which pins that last detail down.
 
 ---
 
@@ -259,11 +280,38 @@ $E000-$FFFF  KERNAL ROM       (reads; writes go to RAM beneath)
   info banner (CPU/video/SID/audio device/keyboard) on start.
   `cargo run -p emu --release`.
 
+- **`iec`** — the serial bus itself: three open-collector lines resolved
+  wired-OR, plus a device-side protocol state machine (LISTEN / TALK / OPEN /
+  CLOSE, the bit handshake, and the EOI stall). CIA2's `$DD00` is wired to it on
+  the C64 side, with the output-bit inversion documented where it belongs.
+- **`d64::DiskDrive`** — a `.d64` behind that protocol, including the `$`
+  directory, which a real drive fabricates as a **BASIC program** so that
+  `LOAD"$",8` + `LIST` renders a listing.
+- **`LOAD` over the emulated bus.** The genuine KERNAL asserts ATN, addresses
+  device 8, sends a filename a bit at a time, turns the bus around and reads the
+  file back — verified end-to-end against the real ROM by
+  `loads_the_directory_over_the_bus` and `loads_a_program_over_the_bus`.
+
+- **`harness`** — a headless C64 for tests: boot it, type at it, wait for text,
+  read the screen. The seam bugs in this project (a keystroke that never becomes
+  a keypress, a handshake that stalls) are only visible from outside the whole
+  machine, so the tests drive the real ROMs and read the screen like a person.
+- The drive's **command/error channel** (secondary address 15), reporting real
+  DOS status lines — which is what turns a silent failed load into
+  `62,FILE NOT FOUND,00,00`.
+- **VIC-II sprite collisions** (`$D01E`/`$D01F`), including read-to-clear and
+  the once-until-acknowledged collision interrupt.
+
 ### Next
-- VIC-II raster interrupts, sprites, bitmap/multicolour modes.
-- The SID analog filter ($D415-$D417).
+- **Wire the real 1541 firmware to the same bus.** The drive already boots its
+  own DOS; what it lacks is a read channel. That means VIA1 for the serial lines
+  (the drive side of the handshake, where the ATN acknowledge is *hardware*) and
+  VIA2 plus a GCR-encoded track model for the disk itself. The `iec::Device`
+  above is the reference to compare its behaviour against.
+- The drive's command/error channel (secondary address 15) and `SAVE`.
 
 ### Later
 - Port the C64 chips to `no_std` on a fast MCU (RP2040 / Teensy / ESP32).
-- Serial IEC bus between the C64 and the 1541 (load a `.d64`).
-- SID audio.
+- VIC-II border rendering, sprite collisions, cycle-exact timing.
+- The SID analog filter (`$D415`-`$D417`).
+- A debugger UI (monitor: registers, disassembly, breakpoints).
