@@ -8,6 +8,8 @@
 //!
 //! Run from the workspace root:  cargo run -p emu --release
 
+mod status;
+
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::process::ExitCode;
@@ -125,6 +127,7 @@ fn main() -> ExitCode {
     println!(
         "  edit keys : Return, arrows = cursor, Home = HOME, Del/Backspace = DEL, F1-F8 = C64 F-keys"
     );
+    println!("  joystick  : port 2 = arrow keys, fire = Space / RightCtrl / LeftAlt");
     println!("  break     : Ctrl+C = RUN/STOP    RESTORE = PageUp (Ctrl+C+PageUp = warm reset)");
     println!("  quit      : Esc\n");
 
@@ -301,6 +304,27 @@ fn main() -> ExitCode {
         }
     };
     window.set_target_fps(50);
+
+    // Optional system-monitor window (`--status`): a second window showing CPU,
+    // banking, VIC, serial-bus and joystick state, snapshotted once per frame.
+    let mut monitor = if args.iter().any(|a| a == "--status") {
+        match Window::new(
+            "C64 Monitor",
+            status::WIDTH,
+            status::HEIGHT,
+            WindowOptions { scale: Scale::X2, resize: true, ..WindowOptions::default() },
+        ) {
+            Ok(w) => Some((w, status::Monitor::new())),
+            Err(e) => {
+                eprintln!("warning: cannot open monitor window: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut frame_count: u32 = 0;
+
     let debug_keys = args.iter().any(|a| a == "--debug-keys");
     if debug_keys {
         println!("  debug     : logging every character the host delivers\n");
@@ -366,6 +390,31 @@ fn main() -> ExitCode {
             c64.nmi();
         }
 
+        // Joystick in port 2 (what most games read) from the arrow keys and a
+        // fire button. The arrows drive CRSR *and* the joystick — harmless,
+        // since a program reads one or the other — so games work either way.
+        use c64::joystick as j;
+        let mut joy2 = j::CENTER;
+        if window.is_key_down(Key::Up) {
+            joy2 &= !j::UP;
+        }
+        if window.is_key_down(Key::Down) {
+            joy2 &= !j::DOWN;
+        }
+        if window.is_key_down(Key::Left) {
+            joy2 &= !j::LEFT;
+        }
+        if window.is_key_down(Key::Right) {
+            joy2 &= !j::RIGHT;
+        }
+        if window.is_key_down(Key::Space)
+            || window.is_key_down(Key::RightCtrl)
+            || window.is_key_down(Key::LeftAlt)
+        {
+            joy2 &= !j::FIRE;
+        }
+        c64.set_joystick(2, joy2);
+
         // Run one video frame: render each scanline as the raster reaches it (so
         // raster-interrupt splits appear) and sample the SID as we go.
         let mut samples: Vec<f32> = Vec::new();
@@ -412,6 +461,15 @@ fn main() -> ExitCode {
         if let Err(e) = window.update_with_buffer(&fb, WIDTH, HEIGHT) {
             eprintln!("error: {e}");
             return ExitCode::FAILURE;
+        }
+
+        // Redraw the monitor window from a fresh per-frame snapshot.
+        frame_count = frame_count.wrapping_add(1);
+        if let Some((mon_win, mon)) = monitor.as_mut() {
+            if mon_win.is_open() {
+                mon.render(&c64, drive.is_some(), frame_count);
+                let _ = mon_win.update_with_buffer(mon.framebuffer(), status::WIDTH, status::HEIGHT);
+            }
         }
     }
 

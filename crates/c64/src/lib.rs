@@ -22,6 +22,25 @@ use mos6502::{Bus, Cpu};
 use sid::Sid;
 use vic2::Vic;
 
+/// Joystick direction/fire bits for [`C64::set_joystick`]. The C64 reads a
+/// joystick **active-low**, so a mask is built by *clearing* the bits that are
+/// pressed, starting from [`joystick::CENTER`].
+///
+/// ```
+/// use c64::joystick;
+/// // Up-and-left with fire held:
+/// let mask = joystick::CENTER & !(joystick::UP | joystick::LEFT | joystick::FIRE);
+/// ```
+pub mod joystick {
+    pub const UP: u8 = 0x01;
+    pub const DOWN: u8 = 0x02;
+    pub const LEFT: u8 = 0x04;
+    pub const RIGHT: u8 = 0x08;
+    pub const FIRE: u8 = 0x10;
+    /// Nothing pressed.
+    pub const CENTER: u8 = 0xFF;
+}
+
 /// A cartridge plugged into the expansion port.
 ///
 /// The port is not just extra ROM — it carries two lines, `EXROM` and `GAME`,
@@ -107,6 +126,12 @@ pub struct Board {
     /// port-A select line `c` and port-B return line `r` is held down. Index by
     /// the KERNAL matrix code: line = idx/8, bit = idx%8.
     pub key_matrix: [u8; 8],
+    /// Joystick states, **active-low**: a clear bit means pressed. Bits
+    /// 0-4 = up/down/left/right/fire; default `$FF` (centered, not firing).
+    /// Port 2 shares CIA1 port A ($DC00), port 1 shares port B ($DC01) — the same
+    /// pins the keyboard uses, so a joystick pulls those read lines low.
+    pub joy1: u8,
+    pub joy2: u8,
     /// The serial (IEC) bus hanging off CIA2. The C64 occupies
     /// [`iec::CONTROLLER`]; a drive attaches to another slot and is clocked by
     /// whoever owns both machines (see [`C64::step`]).
@@ -130,6 +155,8 @@ impl Board {
             port_ddr: 0x00,
             port_data: 0x00,
             key_matrix: [0; 8],
+            joy1: 0xFF,
+            joy2: 0xFF,
             iec: iec::Bus::new(),
             cart: None,
         };
@@ -158,20 +185,40 @@ impl Board {
         self.charen() && (self.loram() || self.hiram())
     }
 
+    /// The 6510 port at `$01` as the CPU reads it (banking latch).
+    pub fn port01(&self) -> u8 {
+        (self.port_data & self.port_ddr) | !self.port_ddr
+    }
+
+    /// What is currently banked in, for a status/monitor display:
+    /// `(basic @ $A000, kernal @ $E000, io @ $D000, chargen @ $D000)`.
+    pub fn banking(&self) -> (bool, bool, bool, bool) {
+        let any_rom = self.loram() || self.hiram();
+        (
+            self.loram() && self.hiram(), // BASIC
+            self.hiram(),                 // KERNAL
+            self.io_mapped(),             // I/O
+            !self.charen() && any_rom,    // CHARGEN
+        )
+    }
+
     fn io_read(&mut self, addr: u16) -> u8 {
         match addr {
             0xD000..=0xD3FF => self.vic.read(addr as u8 & 0x3F),
             0xD400..=0xD7FF => self.sid.read(addr as u8 & 0x1F),
             0xD800..=0xDBFF => self.ram[addr as usize] & 0x0F | 0xF0, // colour RAM (4-bit)
-            0xDC00..=0xDCFF => {
-                // Reading CIA1 port B returns the keyboard rows for whichever
-                // columns port A is currently driving low.
-                if addr as u8 & 0x0F == 0x01 {
-                    let prb = self.keyboard_prb();
-                    self.cia1.pb_in = prb;
+            0xDC00..=0xDCFF => match addr as u8 & 0x0F {
+                // Port A ($DC00): keyboard column drive, but a joystick in port 2
+                // pulls its pins low regardless — so AND its mask into the read.
+                0x00 => self.cia1.read(0) & self.joy2,
+                // Port B ($DC01): the keyboard rows for whichever columns port A
+                // is driving low, plus a joystick in port 1 on the same lines.
+                0x01 => {
+                    self.cia1.pb_in = self.keyboard_prb() & self.joy1;
+                    self.cia1.read(1)
                 }
-                self.cia1.read(addr as u8 & 0x0F)
-            }
+                reg => self.cia1.read(reg),
+            },
             0xDD00..=0xDDFF => {
                 // Reading CIA2 port A samples the two serial-bus input lines.
                 if addr as u8 & 0x0F == 0x00 {
@@ -446,6 +493,17 @@ impl C64 {
         self.cpu.nmi(&mut self.board);
     }
 
+    /// Set a joystick's state. `port` is 1 or 2; `mask` is active-low with bits
+    /// 0-4 = up/down/left/right/fire (a clear bit = pressed), so `$FF` is
+    /// centered and not firing. Build it from the [`joystick`] constants.
+    pub fn set_joystick(&mut self, port: u8, mask: u8) {
+        match port {
+            1 => self.board.joy1 = mask,
+            2 => self.board.joy2 = mask,
+            _ => {}
+        }
+    }
+
     /// Render the whole display in one shot with the current VIC state
     /// (no mid-frame raster effects). Handy for tests and simple use.
     ///
@@ -561,5 +619,42 @@ mod cartridge_tests {
         let c = Cartridge::lo8k(&[0x01, 0x02]);
         assert_eq!(c.roml[0], 0x01);
         assert_eq!(c.roml[2], 0x00, "the rest reads as zero rather than panicking");
+    }
+}
+
+#[cfg(test)]
+mod joystick_tests {
+    use super::*;
+
+    /// Blank ROMs — these tests only exercise the CIA1 port reads.
+    fn board() -> Board {
+        Board::new(&[0; 0x2000], &[0; 0x2000], &[0; 0x1000])
+    }
+
+    #[test]
+    fn joystick2_pulls_dc00_bits_low() {
+        let mut b = board();
+        // Up + fire held (active-low: clear those bits).
+        b.joy2 = joystick::CENTER & !(joystick::UP | joystick::FIRE);
+        let v = b.read(0xDC00); // I/O is mapped at reset ($37 banking)
+        assert_eq!(v & joystick::UP, 0, "up is pressed -> bit low");
+        assert_eq!(v & joystick::FIRE, 0, "fire is pressed -> bit low");
+        assert_eq!(v & joystick::DOWN, joystick::DOWN, "down is released -> bit high");
+        assert_eq!(v & joystick::RIGHT, joystick::RIGHT, "right is released -> bit high");
+    }
+
+    #[test]
+    fn joystick1_and_the_keyboard_share_dc01() {
+        let mut b = board();
+        b.joy1 = joystick::CENTER & !joystick::LEFT; // left held on joystick 1
+        let v = b.read(0xDC01);
+        assert_eq!(v & joystick::LEFT, 0, "joystick 1 pulls its DATA line low on $DC01");
+    }
+
+    #[test]
+    fn centered_joystick_reads_all_ones() {
+        let mut b = board();
+        // No keys, no joystick: $DC00 low bits all high (nothing pressed).
+        assert_eq!(b.read(0xDC00) & 0x1F, 0x1F);
     }
 }
