@@ -8,6 +8,7 @@
 //!
 //! Run from the workspace root:  cargo run -p emu --release
 
+mod debug;
 mod status;
 
 use std::cell::RefCell;
@@ -358,6 +359,19 @@ fn main() -> ExitCode {
         debug: debug_keys,
     }));
 
+    // Live debugger over stdin: a reader thread feeds typed command lines to the
+    // main loop, which answers them against the running machine.
+    let (dbg_tx, dbg_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::stdin().lock().lines().map_while(Result::ok) {
+            if dbg_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    println!("debugger : type 'help' + Enter in this terminal for live commands\n");
+
     // One typed character is held down for a couple of frames (so the KERNAL's
     // 60 Hz keyboard scan catches it) then released for a gap frame.
     let mut typist = Typist::default();
@@ -372,6 +386,14 @@ fn main() -> ExitCode {
     let mut kb_direct = false;
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
+        // Answer any debugger commands typed in the terminal.
+        while let Ok(line) = dbg_rx.try_recv() {
+            let out = debug::command(&mut c64, &line);
+            if !out.is_empty() {
+                println!("{out}");
+            }
+        }
+
         let ctrl = window.is_key_down(Key::LeftCtrl)
             || window.is_key_down(Key::RightCtrl)
             || window.is_key_down(Key::LeftSuper)

@@ -1,97 +1,105 @@
-//! Load a program and dump the machine's state, to diagnose a game that hangs.
-//!   cargo run -p emu --example diag -- prg/Q-bert.d64 [frames]
+//! Diagnose a game that hangs, reproducing the real bus-load path.
+//!   cargo run -p emu --example diag --release -- prg/Q-bert.d64 [runframes]
 
 use harness::Harness;
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: diag <file.prg|.d64> [frames]");
-    let frames: u32 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(1500);
-
+    let path = std::env::args().nth(1).expect("usage: diag <file.d64|.prg> [frames]");
+    let run_frames: u32 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(2000);
     let bytes = std::fs::read(&path).expect("read file");
-    let prg = if path.to_ascii_lowercase().ends_with(".d64") {
-        d64::Disk::new(bytes).expect("d64").read_prg("*").expect("a PRG on the disk")
+
+    let is_d64 = path.to_ascii_lowercase().ends_with(".d64");
+    let mut h = if is_d64 {
+        // The authentic path: a drive on the bus, LOAD over three wires, RUN.
+        let disk = d64::Disk::new(bytes).expect("valid .d64");
+        let mut h = Harness::with_disk(disk).expect("ROMs in roms/");
+        h.boot();
+        h.type_text("load\"*\",8,1\r");
+        assert!(h.wait_for("LOADING", 5000), "drive never answered:\n{}", h.screen());
+        // Wait for the load to finish (KERNAL sets ST bit 6 = EOI at $90).
+        let done = h.run_until(200_000, |c| c.board.ram[0x90] & 0x40 != 0);
+        println!("load finished: {done}  (ST=${:02X})", h.c64.board.ram[0x90]);
+        h.type_text("run\r");
+        h
     } else {
-        bytes
+        let mut h = Harness::new().expect("ROMs in roms/");
+        h.boot();
+        h.c64.load_prg(&bytes);
+        h.type_text("run\r");
+        h
     };
+    h.run_frames(run_frames);
 
-    let mut h = Harness::new().expect("ROMs in roms/");
-    h.boot();
-    let addr = h.c64.load_prg(&prg);
-    println!("loaded {} -> ${addr:04X} ({} bytes)", path, prg.len());
-    h.type_text("run\r");
-    h.run_frames(frames);
-
-    let c = &h.c64;
-    let vr = &c.board.vic.regs;
-    let cia2 = c.board.cia2_pra();
-    let bank = (3 - (cia2 & 3) as usize) * 0x4000;
-    let video = bank + ((vr[0x18] >> 4) as usize & 0x0F) * 0x0400;
-
-    println!("\n--- after {frames} frames ---");
-    println!("CPU  PC:{:04X}  cycles:{}", c.cpu.pc, c.cpu.cycles);
+    let c = &mut h.c64;
+    let vr = c.board.vic.regs;
+    println!("\n--- after RUN + {run_frames} frames ---");
     println!(
-        "VIC  D011:{:02X} D016:{:02X} D018:{:02X}  border:{:X} bg:{:X}",
-        vr[0x11], vr[0x16], vr[0x18], vr[0x20] & 15, vr[0x21] & 15
+        "CPU  PC:{:04X}  I(irq-disabled):{}  cycles:{}",
+        c.cpu.pc, c.cpu.i as u8, c.cpu.cycles
     );
+    let raster_cmp = vr[0x12] as u16 | (((vr[0x11] & 0x80) as u16) << 1);
     println!(
-        "SPR  enable:{:02X}  x-exp:{:02X} y-exp:{:02X} mc:{:02X} pri:{:02X}  mc0:{:X} mc1:{:X}",
-        vr[0x15], vr[0x1D], vr[0x17], vr[0x1C], vr[0x1B], vr[0x25] & 15, vr[0x26] & 15
+        "VIC  D011:{:02X} D016:{:02X}  raster:{}  compare:{}  D01A(en):{:02X}  irq_asserted:{}",
+        vr[0x11],
+        vr[0x16],
+        c.board.vic.raster(),
+        raster_cmp,
+        vr[0x1A],
+        c.board.vic.irq_asserted()
     );
-    for i in 0..8 {
-        if vr[0x15] & (1 << i) != 0 {
-            let ptr = c.board.ram[(video + 0x3F8 + i) & 0xFFFF];
-            let x = vr[i * 2] as u16 | (((vr[0x10] >> i) & 1) as u16) << 8;
-            println!(
-                "  spr{i}: x={:3} y={:3} col:{:X} ptr:${:02X} (data ${:04X})",
-                x, vr[1 + i * 2], vr[0x27 + i] & 15, ptr, bank + ptr as usize * 64
-            );
-        }
-    }
-    println!("raster-IRQ enable D01A:{:02X}", vr[0x1A]);
+    println!("$0314 IRQ vector -> ${:02X}{:02X}", c.board.ram[0x0315], c.board.ram[0x0314]);
+    println!("SPR enable D015:{:02X}", vr[0x15]);
+    println!("screen row 0: {:?}", screen_text(&c.board.ram, 0));
 
-    // Is the CPU stuck? Sample the PC over many raw steps (no drive/input).
+    // Stuck? sample PC.
     use std::collections::HashSet;
     let mut seen = HashSet::new();
     let (mut lo, mut hi) = (0xFFFFu16, 0u16);
-    for _ in 0..100_000u32 {
-        let pc = h.c64.cpu.pc;
+    let mut in_kernal_irq = 0u32;
+    for _ in 0..200_000u32 {
+        let pc = c.cpu.pc;
         seen.insert(pc);
         lo = lo.min(pc);
         hi = hi.max(pc);
-        h.c64.step();
+        if (0xEA00..0xEB00).contains(&pc) {
+            in_kernal_irq += 1;
+        }
+        c.step();
     }
     println!(
-        "\nPC over 100k steps: {} distinct, range ${lo:04X}..${hi:04X}  {}",
+        "\nPC over 200k steps: {} distinct, range ${lo:04X}..${hi:04X}, {in_kernal_irq} in KERNAL-IRQ  {}",
         seen.len(),
-        if seen.len() < 400 { "<< STUCK IN A LOOP" } else { "(running)" }
+        if seen.len() < 500 { "<< STUCK" } else { "(running)" }
     );
 
-    // Dump the code region around the stuck loop so we can disassemble what it
-    // polls. Read through the banking (peek) so we see what the CPU sees.
-    let start = (lo as usize) & 0xFFF0;
-    let end = ((hi as usize) + 0x20).min(0x1_0000);
-    let mut region = Vec::new();
-    for a in start..end {
-        region.push(h.c64.board.ram[a]);
-    }
-    std::fs::write("stuck.bin", &region).unwrap();
-    println!("wrote stuck.bin: ${start:04X}..${end:04X}  (disasm with --org {start:#06X})");
-
-    // Hypothesis: it's waiting for the '2' key (matrix code 59). Hold it down and
-    // see whether the loop breaks — proving the game just wants input.
-    let before = h.c64.cpu.pc;
-    for _ in 0..120u32 {
-        h.c64.board.key_matrix = [0; 8];
-        h.c64.board.set_key(59, true); // '2'
-        let deadline = h.c64.cpu.cycles.wrapping_add(19_700);
-        while h.c64.cpu.cycles < deadline {
-            h.c64.step();
+    // Does holding the '1' key (matrix 56) break it out?
+    let before = c.cpu.pc;
+    for _ in 0..180u32 {
+        c.board.key_matrix = [0; 8];
+        c.board.set_key(56, true); // '1'
+        let deadline = c.cpu.cycles.wrapping_add(19_700);
+        while c.cpu.cycles < deadline {
+            c.step();
         }
     }
-    let after = h.c64.cpu.pc;
-    let escaped = !(0x9104..=0x93CC).contains(&after);
     println!(
-        "\ninjected '2' key: PC {before:04X} -> {after:04X}  {}",
-        if escaped { "<< LEFT THE LOOP: it was waiting for input!" } else { "(still looping)" }
+        "held '1' key: PC {before:04X} -> {:04X}  {}",
+        c.cpu.pc,
+        if (lo..=hi).contains(&c.cpu.pc) { "(still in same region)" } else { "<< MOVED ON" }
     );
+    println!("screen row 0 now: {:?}", screen_text(&c.board.ram, 0));
+}
+
+fn screen_text(ram: &[u8], row: usize) -> String {
+    (0..40)
+        .map(|col| {
+            let sc = ram[0x0400 + row * 40 + col] & 0x7F;
+            match sc {
+                0 => '@',
+                1..=26 => (b'A' + sc - 1) as char,
+                0x20..=0x3F => sc as char,
+                _ => '.',
+            }
+        })
+        .collect()
 }

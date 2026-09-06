@@ -16,6 +16,7 @@ cpal = "0.15"
 arboard = "3"
 iec = { path = "../../crates/iec" }
 harness = { path = "../../crates/harness" }
+mos6502 = { path = "../../crates/mos6502" }
 
 [[bin]]
 name = "emu"
