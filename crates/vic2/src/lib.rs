@@ -11,9 +11,8 @@
 //! Rendering is **per scanline** ([`Vic::render_line`]), so a raster-interrupt
 //! handler that reprograms the VIC mid-frame produces the right split.
 //!
-//! Not yet modeled: sprite/background priority nuances (`$D01B`), the
-//! exact bad-line timing, and the border area (we render the 320x200 display
-//! window). `no_std`, MCU-ready.
+//! Not yet modeled: the exact bad-line timing, and the border area (we render
+//! the 320x200 display window). `no_std`, MCU-ready.
 
 #![no_std]
 
@@ -293,6 +292,9 @@ impl Vic {
             let x_expand = self.regs[0x1D] & (1 << i) != 0;
             let y_expand = self.regs[0x17] & (1 << i) != 0;
             let multicolor = self.regs[0x1C] & (1 << i) != 0;
+            // $D01B: when set, this sprite is drawn *behind* foreground graphics —
+            // it still collides, but a foreground pixel hides it.
+            let behind = self.regs[0x1B] & (1 << i) != 0;
 
             let sy = self.regs[0x01 + i * 2] as i32;
             let top = sy - SPRITE_Y_ORIGIN;
@@ -333,7 +335,9 @@ impl Vic {
                         let x = left + (pair as i32) * 2 * px_w + sub;
                         if (0..WIDTH as i32).contains(&x) {
                             let x = x as usize;
-                            fb[line_base + x] = color;
+                            if !(behind && foreground[x]) {
+                                fb[line_base + x] = color;
+                            }
                             mark(x, i, foreground, &mut owner, &mut hit_sprite, &mut hit_bg);
                         }
                     }
@@ -349,7 +353,9 @@ impl Vic {
                         let x = left + (bit as i32) * px_w + sub;
                         if (0..WIDTH as i32).contains(&x) {
                             let x = x as usize;
-                            fb[line_base + x] = color;
+                            if !(behind && foreground[x]) {
+                                fb[line_base + x] = color;
+                            }
                             mark(x, i, foreground, &mut owner, &mut hit_sprite, &mut hit_bg);
                         }
                     }
@@ -658,5 +664,37 @@ mod tests {
         let mut fb = [0u32; WIDTH * HEIGHT];
         vic.render_line(0, &ram, &char_rom, 0x07, &mut fb);
         assert_eq!(fb[0], PALETTE[2]); // red sprite pixel
+    }
+
+    #[test]
+    fn sprite_background_priority_hides_the_sprite() {
+        // A foreground character pixel at (0,0), and a red sprite over it.
+        let mut vic = Vic::new();
+        vic.write(0x18, 0x14); // screen $0400, chars = ROM
+        vic.write(0x21, 0x06); // blue background
+        vic.write(0x15, 0x01); // sprite 0 on
+        vic.write(0x27, 0x02); // sprite 0 red
+        vic.write(0x00, SPRITE_X_ORIGIN as u8);
+        vic.write(0x01, SPRITE_Y_ORIGIN as u8);
+        let mut ram = [0u8; 0x10000];
+        ram[0x0400] = 0x01; // a character at cell 0
+        ram[0xD800] = 0x01; // white foreground
+        ram[0x07F8] = 0x20; // sprite data at $0800
+        ram[0x0800] = 0x80; // sprite top-left pixel set
+        let mut char_rom = [0u8; 0x1000];
+        char_rom[0x08] = 0x80; // glyph 1, row 0: a foreground pixel at col 0
+
+        // In front (default): the sprite wins.
+        let mut fb = [0u32; WIDTH * HEIGHT];
+        vic.render_line(0, &ram, &char_rom, 0x07, &mut fb);
+        assert_eq!(fb[0], PALETTE[2], "sprite should draw in front by default");
+
+        // Behind ($D01B bit 0 set): the foreground character pixel wins.
+        vic.write(0x1B, 0x01);
+        let mut fb = [0u32; WIDTH * HEIGHT];
+        vic.render_line(0, &ram, &char_rom, 0x07, &mut fb);
+        assert_eq!(fb[0], PALETTE[1], "a foreground pixel must hide a low-priority sprite");
+        // ...but the collision is still recorded regardless of priority.
+        assert_eq!(vic.read(0x1F) & 0x01, 0x01, "sprite-background collision still latches");
     }
 }
