@@ -1,0 +1,8 @@
+[package]
+name = "gcr"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Group-Code-Recording (GCR) encoding for 1541 disk tracks — the on-disk format the drive's read head actually sees."
+
+[dependencies]
