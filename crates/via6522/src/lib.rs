@@ -33,6 +33,7 @@ const IER: u8 = 0xE; // interrupt enable register
 const ORA_NH: u8 = 0xF; // port A, no handshake
 
 // IFR / IER bit positions.
+const FLAG_CA1: u8 = 0x02;
 const FLAG_T2: u8 = 0x20;
 const FLAG_T1: u8 = 0x40;
 const FLAG_IRQ: u8 = 0x80;
@@ -65,6 +66,7 @@ pub struct Via {
     ifr: u8, // without the summary bit 7
     ier: u8, // without bit 7
     sr: u8,
+    ca1: bool, // last level seen on the CA1 input (for edge detection)
 }
 
 impl Default for Via {
@@ -87,6 +89,7 @@ impl Default for Via {
             ifr: 0,
             ier: 0,
             sr: 0,
+            ca1: true,
         }
     }
 }
@@ -110,6 +113,21 @@ impl Via {
     /// True while this VIA is pulling the shared IRQ line low.
     pub fn irq_asserted(&self) -> bool {
         (self.ifr & self.ier & 0x7F) != 0
+    }
+
+    /// Drive the CA1 input to `level` and latch a CA1 interrupt on the active
+    /// edge (PCR bit 0 selects rising vs falling). The 1541 wires ATN here, so
+    /// the drive's DOS takes an interrupt the instant the C64 asserts attention.
+    pub fn set_ca1(&mut self, level: bool) {
+        let active = if self.pcr & 0x01 != 0 {
+            !self.ca1 && level // positive (rising) edge
+        } else {
+            self.ca1 && !level // negative (falling) edge
+        };
+        if active {
+            self.ifr |= FLAG_CA1;
+        }
+        self.ca1 = level;
     }
 
     /// Advance both timers by `cycles` system clocks.
@@ -150,7 +168,11 @@ impl Via {
     pub fn read(&mut self, reg: u8) -> u8 {
         match reg & 0x0F {
             ORB => self.port_b(),
-            ORA | ORA_NH => self.port_a(),
+            ORA => {
+                self.ifr &= !FLAG_CA1; // reading port A acknowledges CA1
+                self.port_a()
+            }
+            ORA_NH => self.port_a(), // ...but the no-handshake alias does not
             DDRB => self.ddrb,
             DDRA => self.ddra,
             T1CL => {
@@ -182,7 +204,11 @@ impl Via {
     pub fn write(&mut self, reg: u8, val: u8) {
         match reg & 0x0F {
             ORB => self.orb = val,
-            ORA | ORA_NH => self.ora = val,
+            ORA => {
+                self.ifr &= !FLAG_CA1; // writing port A also acknowledges CA1
+                self.ora = val;
+            }
+            ORA_NH => self.ora = val,
             DDRB => self.ddrb = val,
             DDRA => self.ddra = val,
             T1CL | T1LL => self.t1_latch = (self.t1_latch & 0xFF00) | val as u16,
@@ -229,6 +255,32 @@ mod tests {
         via.write(ORB, 0b0000_0101); // drive low nibble
         // Low nibble from ORB (0101), high nibble from input pins (1010).
         assert_eq!(via.read(ORB), 0b1010_0101);
+    }
+
+    #[test]
+    fn ca1_falling_edge_raises_an_interrupt() {
+        let mut via = Via::new();
+        via.write(IER, 0x80 | FLAG_CA1); // enable the CA1 interrupt
+        via.write(PCR, 0x00); // CA1 active on the negative (falling) edge
+        via.set_ca1(true); // start high
+        assert!(!via.irq_asserted());
+        via.set_ca1(false); // falling edge -> flag
+        assert!(via.irq_asserted());
+        assert_eq!(via.read(IFR) & FLAG_CA1, FLAG_CA1);
+        // Reading port A acknowledges CA1.
+        via.read(ORA);
+        assert!(!via.irq_asserted());
+    }
+
+    #[test]
+    fn ca1_edge_polarity_follows_pcr() {
+        let mut via = Via::new();
+        via.write(IER, 0x80 | FLAG_CA1);
+        via.write(PCR, 0x01); // positive (rising) edge
+        via.set_ca1(false);
+        assert!(!via.irq_asserted());
+        via.set_ca1(true); // rising edge -> flag
+        assert!(via.irq_asserted());
     }
 
     #[test]
