@@ -236,5 +236,34 @@ don't commit disk images or ROMs.
 ## Roadmap
 
 [`docs/roadmap.md`](docs/roadmap.md) — detailed, with enough context on each item
-to pick it up cold. The next big one is putting the real 1541 firmware on the
-serial bus (VIA1 wiring, the VIA2 disk controller, and GCR track synthesis).
+to pick it up cold.
+
+### Current state — pick up here (2026-09-07)
+
+The big item, "put the real 1541 firmware on the serial bus," is **most of the
+way done**. Sub-items 1a (VIA1 → bus), 1b (VIA2 → disk controller,
+`crates/c1541/src/disk.rs`) and 1c (GCR track synthesis, `crates/gcr`) are all
+built, tested and committed on branch `serial-bus-and-harness`. The booted 1541
+DOS reads a real sector off an emulated GCR disk through its own job queue —
+verified by `c1541::machine::tests::dos_reads_a_sector_through_its_job_queue`. See
+the four new disk gotchas above (SO pin, sync suppression, stepper direction, ID
+order) before touching `disk.rs`.
+
+**Next, in order** (also in the roadmap §1 progress block):
+
+1. **Seek during a job.** The raw `$80` READ job reads whatever track the head is
+   on; the test pre-positions it with `board.disk.seek(18)`. The DOS's *file*
+   layer seeks separately — confirm that path drives the stepper and a seek from
+   track 1 to 18 converges (direction was flipped once; `disk.rs` steps inward on
+   phase **decrement**).
+2. **The real end-to-end test.** `LOAD"$",8` then `LOAD"*",8,1` from a C64 on the
+   same bus with the *virtual* `iec::Device` unplugged — served entirely by the
+   firmware + this disk controller. Wire a `c1541::Machine` into `apps/emu`
+   alongside the C64 and clock both on one `iec::Bus` (drive via
+   `Machine::step_on_bus`).
+3. **Status UI.** Add a **Drive** panel to `apps/emu --status`: current track,
+   motor/LED, SYNC, head activity. (Explicitly requested; not yet done.)
+
+Timing is floors, not measured — a fast loader counting cycles won't work yet.
+`.scratch/` (gitignored) holds a disasm dump; keep temp files inside the project,
+not in the system temp dir.
