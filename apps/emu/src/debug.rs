@@ -35,6 +35,24 @@ pub fn command(c64: &mut C64, line: &str) -> String {
             dis(c64, addr, 16)
         }
         "stuck" => stuck(c64),
+        "cli" => {
+            c64.cpu.i = false;
+            "cleared the CPU I-flag (interrupts enabled) — watch 'cpu'/'stuck'".into()
+        }
+        "sei" => {
+            c64.cpu.i = true;
+            "set the CPU I-flag (interrupts masked)".into()
+        }
+        "run" => {
+            // Free-run a few frames so an effect of a poke/cli can show.
+            for _ in 0..30 {
+                let end = c64.cpu.cycles.wrapping_add(19_700);
+                while c64.cpu.cycles < end {
+                    c64.step();
+                }
+            }
+            format!("ran 30 frames -> PC ${:04X}", c64.cpu.pc)
+        }
         "poke" => {
             let mut it = line.split_whitespace();
             it.next();
@@ -85,6 +103,8 @@ debug commands (type in this terminal while the emulator runs):
   stuck            sample the PC to see if it is looping, and where
   poke <a> <v>     write a RAM byte
   key <code>       hold a keyboard matrix code briefly (56=1 59=2 60=space)
+  cli | sei        clear / set the CPU I-flag (test a masked interrupt)
+  run              free-run ~30 frames (see the effect of cli/poke)
   help | ?         this list
 numbers are hex by default; prefix with # for decimal";
 
