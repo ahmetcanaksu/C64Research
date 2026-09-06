@@ -66,6 +66,30 @@ const SPECIAL_KEYS: &[(Key, u8, bool)] = &[
 /// there is nothing to lose.
 const RETURN_KEYS: &[Key] = &[Key::Enter, Key::NumPadEnter];
 
+/// Physical host key -> C64 keyboard-matrix code, for **direct** (game) mode:
+/// the key is set while held and cleared on release, like a real keyboard.
+/// Positions follow a QWERTY host, so letters and digits line up with the C64.
+/// Arrows and function keys are handled by [`SPECIAL_KEYS`] in both modes.
+fn direct_key_matrix(key: Key) -> Option<u8> {
+    Some(match key {
+        Key::A => 10, Key::B => 28, Key::C => 20, Key::D => 18, Key::E => 14,
+        Key::F => 21, Key::G => 26, Key::H => 29, Key::I => 33, Key::J => 34,
+        Key::K => 37, Key::L => 42, Key::M => 36, Key::N => 39, Key::O => 38,
+        Key::P => 41, Key::Q => 62, Key::R => 17, Key::S => 13, Key::T => 22,
+        Key::U => 30, Key::V => 31, Key::W => 9, Key::X => 23, Key::Y => 25,
+        Key::Z => 12,
+        Key::Key0 => 35, Key::Key1 => 56, Key::Key2 => 59, Key::Key3 => 8,
+        Key::Key4 => 11, Key::Key5 => 16, Key::Key6 => 19, Key::Key7 => 24,
+        Key::Key8 => 27, Key::Key9 => 32,
+        Key::Space => 60,
+        Key::Enter | Key::NumPadEnter => 1,
+        Key::Backspace | Key::Delete => 0,
+        Key::Comma => 47, Key::Period => 44, Key::Slash => 55,
+        Key::Semicolon => 50, Key::Equal => 53, Key::Minus => 43,
+        _ => return None,
+    })
+}
+
 type SharedBuf = Arc<Mutex<VecDeque<f32>>>;
 
 fn load_rom(name: &str) -> Result<Vec<u8>, String> {
@@ -112,7 +136,7 @@ fn main() -> ExitCode {
         None => println!("  audio out : none found — running silent"),
     }
     println!(
-        "  keyboard  : character-translation layer — your host layout → C64 matrix ({} chars mapped)",
+        "  keyboard  : TYPING (host layout → C64, {} chars) — press F12 for DIRECT mode (games)",
         char_map.len()
     );
     let mut clipboard = arboard::Clipboard::new().ok();
@@ -339,34 +363,61 @@ fn main() -> ExitCode {
     let mut typist = Typist::default();
     let mut sample_carry = 0.0f32;
 
+    // Two keyboard modes. TYPING (default) buffers keystrokes through a queue and
+    // translates the host layout — right for BASIC, LOAD, entering text. But a
+    // game reads the raw keyboard matrix, and a queue is exactly wrong for that:
+    // it holds each key for a couple of frames and drains a backlog, so a game
+    // sees phantom held keys. DIRECT mode maps physical keys straight to the
+    // matrix, held only while down — a real keyboard. Toggle with F12.
+    let mut kb_direct = false;
+
     while window.is_open() && !window.is_key_down(Key::Escape) {
-        // Paste the clipboard into the type-ahead queue. Ctrl+V everywhere, and
-        // Cmd+V too, because that is the shortcut a Mac user will actually press.
         let ctrl = window.is_key_down(Key::LeftCtrl)
             || window.is_key_down(Key::RightCtrl)
             || window.is_key_down(Key::LeftSuper)
             || window.is_key_down(Key::RightSuper);
-        if ctrl && window.is_key_pressed(Key::V, KeyRepeat::No) {
-            if let Some(cb) = clipboard.as_mut() {
-                if let Ok(text) = cb.get_text() {
-                    let mut q = type_queue.borrow_mut();
-                    for c in text.chars().take(4096) {
-                        q.push_back(c);
+
+        // F12 switches keyboard mode. Clear any queued typing so it can't leak
+        // into a game the instant you switch.
+        if window.is_key_pressed(Key::F12, KeyRepeat::No) {
+            kb_direct = !kb_direct;
+            type_queue.borrow_mut().clear();
+            let mode = if kb_direct { "DIRECT (games)" } else { "TYPING" };
+            println!("keyboard mode: {mode}");
+            window.set_title(&format!("C64 — keyboard: {mode} — Esc to quit"));
+        }
+
+        c64.board.key_matrix = [0; 8];
+        if kb_direct {
+            // Every host key that maps to a C64 key is set while held and cleared
+            // on release — no queue, no repeat, no stuck keys.
+            for key in window.get_keys() {
+                if let Some(code) = direct_key_matrix(key) {
+                    c64.board.set_key(code, true);
+                }
+            }
+            if window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift) {
+                c64.board.set_key(SHIFT_KEY, true);
+            }
+        } else {
+            // Paste the clipboard into the type-ahead queue (Ctrl+V / Cmd+V).
+            if ctrl && window.is_key_pressed(Key::V, KeyRepeat::No) {
+                if let Some(cb) = clipboard.as_mut() {
+                    if let Ok(text) = cb.get_text() {
+                        let mut q = type_queue.borrow_mut();
+                        for c in text.chars().take(4096) {
+                            q.push_back(c);
+                        }
                     }
                 }
             }
+            // RETURN: one queued '\r' per press, so it can't interleave with
+            // characters still being typed.
+            if RETURN_KEYS.iter().any(|&k| window.is_key_pressed(k, KeyRepeat::No)) {
+                type_queue.borrow_mut().push_back('\r');
+            }
+            typist.frame(&mut c64, &mut type_queue.borrow_mut(), &char_map);
         }
-
-        // RETURN: one queued '\r' per physical press. Going through the queue
-        // (rather than holding the key) keeps it from interleaving with
-        // characters that are still being typed.
-        if RETURN_KEYS.iter().any(|&k| window.is_key_pressed(k, KeyRepeat::No)) {
-            type_queue.borrow_mut().push_back('\r');
-        }
-
-        // Drive the keyboard matrix from the injection state machine.
-        c64.board.key_matrix = [0; 8];
-        typist.frame(&mut c64, &mut type_queue.borrow_mut(), &char_map);
 
         // Ctrl+C, held, presses RUN/STOP — the C64 way to break a running
         // program (BASIC prints "BREAK"). Applied live, on top of any typing.
