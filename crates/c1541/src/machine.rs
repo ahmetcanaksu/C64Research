@@ -62,6 +62,61 @@ impl Bus for Board {
     }
 }
 
+/// The drive's device address (bits 5-6 of VIA1 port B are the jumpers).
+/// Device 8 leaves both jumpers grounded — those bits read 0.
+const DEVICE_8_JUMPERS: u8 = 0x00;
+
+impl Board {
+    /// Sample the serial bus into VIA1's inputs (`$1800`), before the CPU reads
+    /// them.
+    ///
+    /// Port B bit assignments: PB0 DATA-in, PB2 CLK-in, PB7 ATN-in, PB5-6 the
+    /// device-address jumpers. DATA and CLK read the line level directly (1 =
+    /// released/high); **ATN is inverted** on the 1541, so PB7 (and CA1) read 1
+    /// while ATN is asserted. The DOS wires ATN to CA1 with PCR=$01 (rising
+    /// edge), so the drive takes an interrupt the instant the C64 asserts ATN.
+    pub fn sync_bus_in(&mut self, bus: &iec::Bus) {
+        let mut pb = 0xFF;
+        if !bus.data() {
+            pb &= !0x01; // DATA pulled low -> PB0 = 0
+        }
+        if !bus.clk() {
+            pb &= !0x04; // CLK pulled low -> PB2 = 0
+        }
+        if bus.atn() {
+            pb &= !0x80; // ATN released -> inverted PB7 = 0
+        }
+        pb = (pb & !0x60) | DEVICE_8_JUMPERS;
+        self.via1.pb_in = pb;
+        // CA1 = inverted ATN: high while ATN is asserted (bus low).
+        self.via1.set_ca1(!bus.atn());
+    }
+
+    /// Push VIA1's outputs onto the bus after the CPU has run.
+    ///
+    /// PB1/PB3 are the DOS's DATA/CLK outputs (1 = pull the line low), and PB4
+    /// is ATNA. The attention acknowledge is **hardware**: a gate pulls DATA low
+    /// whenever ATNA disagrees with the ATN line, so a drive answers attention
+    /// in nanoseconds — before its CPU runs — wired-OR with the DOS's own DATA
+    /// output.
+    pub fn sync_bus_out(&self, bus: &mut iec::Bus, slot: usize) {
+        let pb = self.via1.port_b();
+        let mut pulls = 0;
+        if pb & 0x02 != 0 {
+            pulls |= iec::line::DATA;
+        }
+        if pb & 0x08 != 0 {
+            pulls |= iec::line::CLK;
+        }
+        let atna = pb & 0x10 != 0;
+        let atn_asserted = !bus.atn();
+        if atna != atn_asserted {
+            pulls |= iec::line::DATA; // hardware ATN acknowledge
+        }
+        bus.set_pulls(slot, pulls);
+    }
+}
+
 /// The whole drive: CPU + board. Kept as separate fields so the CPU can borrow
 /// the board as its bus without aliasing.
 pub struct Machine {
@@ -100,6 +155,15 @@ impl Machine {
         cycles
     }
 
+    /// Execute one instruction with the drive's VIA1 wired to a shared serial
+    /// `bus` at device slot `slot`: sample the bus in, step, drive the bus out.
+    pub fn step_on_bus(&mut self, bus: &mut iec::Bus, slot: usize) -> u8 {
+        self.board.sync_bus_in(bus);
+        let cycles = self.step();
+        self.board.sync_bus_out(bus, slot);
+        cycles
+    }
+
     /// Run for at least `cycles` clocks (finishing the instruction that crosses
     /// the boundary). Returns the number of instructions executed.
     pub fn run_cycles(&mut self, cycles: u64) -> u64 {
@@ -135,6 +199,45 @@ mod tests {
     const IDLE_LOOP_HEAD: u16 = 0xEC00;
     /// The RAM-fault handler; reaching it would mean boot failed.
     const RAM_FAULT: u16 = 0xEA6E;
+
+    /// 1a milestone: the drive boots on a shared serial bus and answers ATN. It
+    /// releases DATA at idle, and pulls DATA low the moment the controller
+    /// asserts attention — the hardware acknowledge plus the DOS taking its CA1
+    /// interrupt.
+    #[test]
+    fn drive_answers_attention_on_the_bus() {
+        let mut drive = Machine::new();
+        let mut bus = iec::Bus::new();
+
+        // Boot to the idle loop, clocked on the bus.
+        let mut booted = false;
+        for _ in 0..3_000_000u64 {
+            drive.step_on_bus(&mut bus, 1);
+            if drive.cpu.pc == IDLE_LOOP_HEAD {
+                booted = true;
+                break;
+            }
+        }
+        assert!(booted, "drive did not boot on the bus");
+
+        // Idle with ATN released: the drive must not be holding DATA down.
+        for _ in 0..5_000 {
+            drive.step_on_bus(&mut bus, 1);
+        }
+        assert!(bus.data(), "at idle the drive should release DATA");
+
+        // The controller asserts ATN — the drive must pull DATA low to answer.
+        bus.pull(iec::CONTROLLER, iec::Line::Atn, true);
+        let mut answered = false;
+        for _ in 0..20_000 {
+            drive.step_on_bus(&mut bus, 1);
+            if !bus.data() {
+                answered = true;
+                break;
+            }
+        }
+        assert!(answered, "the drive must pull DATA low to acknowledge ATN");
+    }
 
     #[test]
     fn boots_into_dos_idle_loop() {
