@@ -5,8 +5,11 @@
 //! "understand → port" half of the disassemble → understand → port pipeline.
 
 #![no_std]
+extern crate alloc;
 
+pub mod disk;
 pub mod machine;
 pub mod ram_test;
 
+pub use disk::{Controller, Disk};
 pub use machine::Machine;

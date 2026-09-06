@@ -9,3 +9,5 @@ description = "1541 disk drive: a bootable machine (CPU + RAM + ROM + 2 VIAs) pl
 mos6502 = { path = "../mos6502" }
 via6522 = { path = "../via6522" }
 iec = { path = "../iec" }
+d64 = { path = "../d64" }
+gcr = { path = "../gcr" }

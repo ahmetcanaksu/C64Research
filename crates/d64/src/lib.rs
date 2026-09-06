@@ -91,6 +91,39 @@ impl Disk {
         &self.data[off..off + SECTOR_SIZE]
     }
 
+    /// Sectors on `track` (the 1541's zoned layout), or 0 for an out-of-range
+    /// track. Exposed so a GCR encoder can walk a whole track.
+    pub fn sectors_on_track(&self, track: u8) -> u8 {
+        if (1..=35).contains(&track) {
+            sectors_in_track(track)
+        } else {
+            0
+        }
+    }
+
+    /// A copy of one sector's raw 256 decoded bytes, or `None` if the
+    /// track/sector is out of range. This is what the emulated drive turns into
+    /// a GCR bitstream for its read head.
+    pub fn sector_bytes(&self, track: u8, sector: u8) -> Option<[u8; 256]> {
+        if !(1..=35).contains(&track) || sector >= sectors_in_track(track) {
+            return None;
+        }
+        let mut out = [0u8; SECTOR_SIZE];
+        out.copy_from_slice(self.sector(track, sector));
+        Some(out)
+    }
+
+    /// The disk's two **raw** ID bytes from the BAM, exactly as they are written
+    /// into every sector header on the physical disk.
+    ///
+    /// Unlike [`Disk::header`], these are not sanitised for display — a sector
+    /// header on disk stores the ID verbatim, and the drive's DOS compares the
+    /// bytes it reads against these, so the drive must GCR-encode the raw values.
+    pub fn id(&self) -> [u8; 2] {
+        let bam = self.sector(DIR_TRACK, 0);
+        [bam[0xA2], bam[0xA3]]
+    }
+
     /// List every directory entry (closed files with a name).
     pub fn dir(&self) -> Vec<DirEntry> {
         let mut entries = Vec::new();

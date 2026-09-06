@@ -14,10 +14,11 @@ something that does. "Make more software run" is not on its own a reason.
 
 | | |
 |---|---|
-| Tests | 127 passing, 0 failing, 1 loud skip (needs a non-redistributable `.prg`) |
+| Tests | 147 passing, 0 failing, 1 loud skip (needs a non-redistributable `.prg`) |
 | `cargo clippy --all-targets` | clean — keep it that way |
 | Boots | real KERNAL + BASIC to `READY.`; real 1541 DOS to its idle loop |
 | Loads | `.prg` (side-load), `.d64` over the emulated serial bus, 8K/16K cartridges |
+| Drive | real 1541 on the bus (VIA1), and its DOS reads a real sector off a synthesised GCR disk through the disk controller (VIA2) — see roadmap §1 |
 
 ---
 
@@ -60,7 +61,32 @@ over three wires, with no host-side shortcut anywhere in the path.
 There are three separable pieces. Do them in this order; each is independently
 verifiable.
 
-#### 1a. VIA1 → the serial bus (the drive's side of the handshake)
+> **Progress (2026-09-07).** 1a, 1b and 1c are **built and unit-tested**. The
+> booted DOS now reads a real sector off an emulated disk through its own job
+> queue — rotating GCR disk → sync detection → BYTE-READY on the CPU's SO pin →
+> header match → GCR data decode — verified end-to-end in
+> `c1541::machine::tests::dos_reads_a_sector_through_its_job_queue`.
+>
+> **What's left to make it whole (start here next):**
+> 1. **Seek during a job.** The raw `$80` READ job reads whatever track the head
+>    is already on; the test pre-positions the head with `board.disk.seek(18)`.
+>    The DOS's *file* layer seeks separately — confirm that path drives the
+>    stepper the right way (direction was flipped once already; `disk.rs` steps
+>    inward on phase **decrement**). A seek that converges from track 1 to 18 is
+>    the proof.
+> 2. **The real end-to-end test.** `LOAD"$",8` (then `LOAD"*",8,1`) from a C64 on
+>    the same bus with the *virtual* `iec::Device` unplugged — served entirely by
+>    the firmware + this disk controller. Wire a `c1541::Machine` into `apps/emu`
+>    alongside the C64 and clock both on one `iec::Bus` (the drive via
+>    `Machine::step_on_bus`).
+> 3. **Status UI.** Add a **Drive** panel to `apps/emu --status`: current track,
+>    motor/LED, SYNC, head activity. (Requested; not yet done.)
+> 4. **ID order.** Sector headers store the two ID bytes as `[id[1], id[0]]`; the
+>    DOS reads them into `$16/$17` in disk order `[id[0], id[1]]` and checks them
+>    against the master ID at `$12/$13` (per drive, indexed by `$3E`). A raw job
+>    needs that master ID pre-loaded (a real access initialises it from the BAM).
+
+#### 1a. VIA1 → the serial bus (the drive's side of the handshake) — ✅ done
 
 Wire `c1541`'s VIA1 (`$1800`) to an `iec::Bus`, mirroring what
 `crates/c64/src/lib.rs` does for CIA2.
@@ -97,7 +123,7 @@ than one.
 takes its ATN interrupt and pulls DATA low when the C64 sends `LISTEN 8`. Compare
 against `iec::Device` doing the same thing — that is what it is there for.
 
-#### 1b. VIA2 → the disk controller
+#### 1b. VIA2 → the disk controller — ✅ done (`crates/c1541/src/disk.rs`)
 
 VIA2 (`$1C00`) is the read/write channel. Port B is the mechanism, port A is the
 data byte:
@@ -118,7 +144,7 @@ This is the biggest single chunk of work in the project. It needs a rotating-dis
 model: a head position, a current track, and a byte stream that advances with
 time.
 
-#### 1c. GCR encoding, so there is something to read
+#### 1c. GCR encoding, so there is something to read — ✅ done (`crates/gcr`)
 
 A `.d64` stores decoded 256-byte sectors. A real drive reads **GCR**: a 4-to-5
 bit encoding chosen so no run of more than two zero bits appears, which is what

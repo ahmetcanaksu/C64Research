@@ -14,6 +14,7 @@
 //! The ROM is embedded with `include_bytes!`, so a built `c1541` is fully
 //! self-contained — no file to ship, and ready to run from flash on an MCU.
 
+use crate::disk::{Controller, Disk};
 use mos6502::{Bus, Cpu};
 use via6522::Via;
 
@@ -22,12 +23,14 @@ pub const ROM: &[u8; 0x4000] = include_bytes!("../../../roms/C1541.rom");
 
 const RAM_SIZE: usize = 0x0800;
 
-/// Everything the CPU talks to: RAM, ROM, and the two VIAs.
+/// Everything the CPU talks to: RAM, ROM, the two VIAs, and the disk mechanism
+/// wired to VIA2.
 pub struct Board {
     pub ram: [u8; RAM_SIZE],
     pub rom: &'static [u8; 0x4000],
     pub via1: Via,
     pub via2: Via,
+    pub disk: Controller,
 }
 
 impl Default for Board {
@@ -37,6 +40,7 @@ impl Default for Board {
             rom: ROM,
             via1: Via::new(),
             via2: Via::new(),
+            disk: Controller::default(),
         }
     }
 }
@@ -144,15 +148,29 @@ impl Machine {
     }
 
     /// Execute one instruction, advance both VIA timers by the cycles it took,
-    /// and service an IRQ if either VIA is asserting one. Returns those cycles.
+    /// rotate the disk under the head, and service an IRQ if either VIA is
+    /// asserting one. Returns those cycles.
+    ///
+    /// The disk's BYTE-READY line is wired to the CPU's SO pin on real hardware,
+    /// setting the V flag the moment a byte arrives; we reproduce that by setting
+    /// `cpu.v` when the mechanism reports a fresh byte, which is what makes the
+    /// DOS's `BVC` read loop advance.
     pub fn step(&mut self) -> u8 {
         let cycles = self.cpu.step(&mut self.board);
         self.board.via1.tick(cycles as u32);
         self.board.via2.tick(cycles as u32);
+        if self.board.disk.tick(&mut self.board.via2, cycles as u32) {
+            self.cpu.v = true; // BYTE-READY -> SO pin -> V flag
+        }
         if self.board.via1.irq_asserted() || self.board.via2.irq_asserted() {
             self.cpu.irq(&mut self.board);
         }
         cycles
+    }
+
+    /// Insert a disk into the drive.
+    pub fn insert_disk(&mut self, disk: Disk) {
+        self.board.disk.insert(disk);
     }
 
     /// Execute one instruction with the drive's VIA1 wired to a shared serial
@@ -199,6 +217,75 @@ mod tests {
     const IDLE_LOOP_HEAD: u16 = 0xEC00;
     /// The RAM-fault handler; reaching it would mean boot failed.
     const RAM_FAULT: u16 = 0xEA6E;
+
+    /// Run the drive until it reaches its idle loop (a healthy, booted DOS with
+    /// its controller interrupt running). Panics if it never gets there.
+    fn boot(m: &mut Machine) {
+        for _ in 0..3_000_000u64 {
+            m.step();
+            if m.cpu.pc == IDLE_LOOP_HEAD {
+                return;
+            }
+        }
+        panic!("drive never reached the idle loop; stuck near ${:04X}", m.cpu.pc);
+    }
+
+    /// 1b milestone: the booted DOS reads a real sector off the emulated disk
+    /// through its own job queue — the whole read path end to end. Posting a
+    /// READ job makes the controller seek to the track (stepping the head and
+    /// confirming its position by reading headers), hunt for the sector's sync
+    /// mark and header, then shift in and GCR-decode the 256-byte data block.
+    ///
+    /// A completion code of `$01` means success; anything else is a specific DOS
+    /// error (`$02` header not found, `$03` no sync, `$05` data checksum, `$0B`
+    /// ID mismatch, `$0F` no disk) — so this test doubles as a precise diagnostic
+    /// if the GCR format or timing is off.
+    #[test]
+    fn dos_reads_a_sector_through_its_job_queue() {
+        let mut drive = Machine::new();
+        boot(&mut drive);
+
+        // Insert a synthetic disk and post a READ of track 18 sector 0 (the BAM)
+        // into buffer 1, whose data lands at $0400. The job queue: code at $01,
+        // header (track/sector) at $08/$09.
+        let image = d64::Disk::new(d64::fixtures::synthetic_image()).unwrap();
+        let id = image.id();
+        drive.insert_disk(Disk::from_d64(&image));
+        // A raw READ job reads whatever track the head is on — the DOS's file
+        // layer seeks first, through a separate path. Put the head on track 18 as
+        // that seek would, so this test isolates the read + GCR-decode path.
+        drive.board.disk.seek(18);
+
+        // A raw READ job checks the ID in the header it reads (which the drive
+        // lands at $16/$17) against the drive's master ID at $12/$13 (per drive,
+        // indexed by $3E), rejecting a mismatch with $0B — see $F3F6. At power-up
+        // that master ID is zero, so present a drive already initialised to this
+        // disk. The drive reads the two header ID bytes into $16/$17 in disk
+        // order [id[0], id[1]], so the master must use that same order.
+        drive.board.ram[0x12] = id[0];
+        drive.board.ram[0x13] = id[1];
+
+        drive.board.ram[0x08] = 18; // buffer 1 wants track 18
+        drive.board.ram[0x09] = 0; //             sector 0
+        drive.board.ram[0x01] = 0x80; // READ
+
+        // Let the controller run the job to completion (it flips the code below
+        // $80 when done).
+        let mut code = 0x80u8;
+        for _ in 0..8_000_000u64 {
+            drive.step();
+            code = drive.board.ram[0x01];
+            if code < 0x80 {
+                break;
+            }
+        }
+        assert_eq!(code, 0x01, "read job returned error code ${code:02X}");
+
+        // The BAM should now be in buffer 1: byte 0 = first directory track (18),
+        // byte 2 = DOS version 'A'.
+        assert_eq!(drive.board.ram[0x0400], 18, "BAM link track");
+        assert_eq!(drive.board.ram[0x0402], b'A', "BAM DOS version byte");
+    }
 
     /// 1a milestone: the drive boots on a shared serial bus and answers ATN. It
     /// releases DATA at idle, and pulls DATA low the moment the controller

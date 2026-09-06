@@ -76,11 +76,12 @@ covering less than it claimed. Never add a silently-skipping test.
 | `crates/vic2` | VIC-II — modes, sprites, raster IRQ, collisions, renderer |
 | `crates/sid` | 6581 SID — 3 voices + ADSR |
 | `crates/cia6526` | 6526 CIA — ports, timers, interrupts |
-| `crates/via6522` | 6522 VIA — used by the 1541 |
+| `crates/via6522` | 6522 VIA — used by the 1541 (with CA1 for ATN) |
 | `crates/iec` | the serial bus + a device that speaks its protocol |
 | `crates/d64` | `.d64` reading, and a drive that serves it over the bus |
+| `crates/gcr` | GCR track synthesis — decoded sectors → the drive's on-disk bitstream |
 | `crates/c64` | the C64: CPU + PLA banking + RAM + ROMs + CIAs + VIC + SID |
-| `crates/c1541` | the 1541 drive machine (its own 6502 + 2 VIAs) |
+| `crates/c1541` | the 1541 drive machine (its own 6502 + 2 VIAs + the disk under the head, `disk.rs`) |
 | `crates/kernal` | **the KERNAL translated to Rust** — reference, not used by the emulator |
 | `crates/harness` | drive a headless C64 from a test |
 | `apps/emu` | windowed emulator + headless script mode |
@@ -183,6 +184,31 @@ collision interrupts permanently.
 
 **In multicolour modes, bit pair `%01` draws a colour but is not foreground.** So
 a sprite passes through it with no collision.
+
+**The 1541's BYTE-READY is the CPU's SO pin, not an interrupt.** The drive reads a
+GCR byte with `BVC *` / `CLV` / `LDA $1C01` (see `$F53D`): the read head's
+byte-ready line is wired to the 6502 SO pin, which sets V asynchronously. So the
+disk controller sets `cpu.v = true` when a fresh byte arrives — that, not any IRQ,
+is what advances the DOS read loop. See `Controller::tick` in `crates/c1541`.
+
+**BYTE-READY is suppressed over a sync mark.** SYNC (VIA2 PB7, active **low**) is
+asserted while the head is over a run of one-bits (`$FF`); during it the byte
+counter is held, which is what byte-aligns the first data byte *after* the mark.
+Model: PB7 low while over two consecutive `$FF`, and no byte-ready pulse there.
+Miss this and the DOS reads sync bytes as data. The DOS finds sync with a
+timeout (`$F556` arms VIA1 T1), so *no* sync marks → error 21, not a hang.
+
+**The stepper steps inward on phase decrement.** Rotating VIA2 PB0-1 down one
+(`(phase-1)&3`) moves the head toward higher track numbers (disk centre), up one
+toward the rim. Get it backwards and a seek from track 1 to 18 just bumps the rim
+stop forever. A raw `$80` READ job does **not** seek — it reads whatever track the
+head is on; the DOS's file layer seeks first through a separate path.
+
+**A sector header stores its two ID bytes reversed from the BAM.** `gcr` writes
+them `[id[1], id[0]]`; the DOS reads them back into `$16/$17` in disk order
+`[id[0], id[1]]` and checks against the master ID at `$12/$13` (per drive, indexed
+by `$3E`). A raw job needs that master ID pre-loaded — a real access initialises
+it from the BAM (`$F410` copies `$16/$17` → `$12/$13`). Mismatch is error `$0B`.
 
 **BASIC relinks `$0801`/`$0802` when it returns to `READY.`** If you assert on
 bytes a `,1` load put there, watch for them *as they arrive* (`run_until_step`),
