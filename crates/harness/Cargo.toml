@@ -10,3 +10,4 @@ c64 = { path = "../c64" }
 c64-kernal = { path = "../kernal" }
 iec = { path = "../iec" }
 d64 = { path = "../d64" }
+c1541 = { path = "../c1541" }

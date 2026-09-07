@@ -33,6 +33,7 @@ pub mod screen;
 
 // Re-exported so a test needs only this one dependency to build a disk, poke
 // the bus, or reach into the machine.
+pub use c1541;
 pub use c64;
 pub use d64;
 pub use iec;
@@ -123,10 +124,81 @@ impl Drive {
     }
 }
 
+/// The **genuine 1541 firmware** on the shared bus: its own 6502 running the
+/// real DOS ROM, with a rotating GCR disk under its head.
+///
+/// Where [`Drive`] simulates the protocol host-side, this simulates the
+/// *hardware* and lets the DOS speak for itself. Nothing in the path is a
+/// shortcut: a `LOAD` is two 6502s handshaking over three wires while a disk
+/// turns.
+///
+/// It has to be clocked alongside the C64, and its instruction boundaries will
+/// not line up with the C64's, so the owed-cycle counter carries the remainder
+/// across calls rather than rounding it away each time.
+pub struct RealDrive {
+    pub machine: Box<c1541::Machine>,
+    slot: usize,
+    owed: i32,
+}
+
+impl RealDrive {
+    /// Power on a drive at device 8 with `disk` in it.
+    ///
+    /// The drive is *not* pre-booted: it runs its RAM test and ROM checksum in
+    /// parallel with the C64's own boot, exactly as two machines switched on
+    /// together do. [`Harness::boot`] gives it the cycles to get there.
+    pub fn new(disk: d64::Disk) -> Self {
+        let mut machine = Box::new(c1541::Machine::new());
+        machine.insert_disk(c1541::Disk::from_d64(&disk));
+        RealDrive { machine, slot: 1, owed: 0 }
+    }
+
+    /// The track the head is over — for a status display, or a test that wants
+    /// to watch it seek.
+    pub fn track(&self) -> u8 {
+        self.machine.board.disk.track()
+    }
+
+    /// Is the spindle motor running? (VIA2 PB2, driven by the DOS.)
+    pub fn motor_on(&self) -> bool {
+        self.machine.board.via2.port_b() & 0x04 != 0
+    }
+
+    /// Is the activity LED lit? (VIA2 PB3 — the light you watch on a real drive.)
+    pub fn led_on(&self) -> bool {
+        self.machine.board.via2.port_b() & 0x08 != 0
+    }
+
+    /// Is the head over a sync mark?
+    pub fn syncing(&self) -> bool {
+        self.machine.board.disk.syncing()
+    }
+
+    /// Where the head is within the track — proof the disk is turning.
+    pub fn head_pos(&self) -> usize {
+        self.machine.board.disk.head_pos()
+    }
+
+    /// The drive CPU's program counter.
+    pub fn pc(&self) -> u16 {
+        self.machine.cpu.pc
+    }
+
+    /// Clock the drive by `cycles` of the C64's time.
+    pub fn tick(&mut self, bus: &mut iec::Bus, cycles: u32) {
+        self.owed += cycles as i32;
+        while self.owed > 0 {
+            self.owed -= self.machine.step_on_bus(bus, self.slot) as i32;
+        }
+    }
+}
+
 /// A C64, plus everything needed to drive it from a test.
 pub struct Harness {
     pub c64: Box<C64>,
     pub drive: Option<Drive>,
+    /// The real firmware, if attached instead of (or beside) the virtual one.
+    pub real_drive: Option<RealDrive>,
     typist: Typist,
     queue: VecDeque<char>,
     char_map: KeyMap,
@@ -144,6 +216,7 @@ impl Harness {
         Some(Harness {
             c64: Box::new(C64::new(&kernal, &basic, &chargen)),
             drive: None,
+            real_drive: None,
             typist: Typist::default(),
             queue: VecDeque::new(),
             char_map: keyboard::char_map(),
@@ -158,10 +231,29 @@ impl Harness {
         Some(h)
     }
 
-    /// Attach a drive (replacing any already there).
+    /// Attach the host-side protocol device (replacing any drive already there).
     pub fn attach(&mut self, disk: d64::Disk) -> &mut Self {
         self.drive = Some(Drive::new(disk));
+        self.real_drive = None;
         self
+    }
+
+    /// Attach the **real 1541 firmware** instead, and unplug the virtual device.
+    ///
+    /// This is the honest configuration: nothing host-side answers the bus, so a
+    /// `LOAD` only works if the DOS, the disk controller and the GCR encoding all
+    /// do their jobs.
+    pub fn attach_real_drive(&mut self, disk: d64::Disk) -> &mut Self {
+        self.real_drive = Some(RealDrive::new(disk));
+        self.drive = None;
+        self
+    }
+
+    /// A machine with the real firmware on the bus from power-on.
+    pub fn with_real_drive(disk: d64::Disk) -> Option<Self> {
+        let mut h = Self::new()?;
+        h.attach_real_drive(disk);
+        Some(h)
     }
 
     /// Queue text to be typed, one keystroke per few frames. Use `\r` for
@@ -181,6 +273,9 @@ impl Harness {
         while self.c64.cpu.cycles < deadline {
             let cycles = self.c64.step();
             if let Some(d) = self.drive.as_mut() {
+                d.tick(&mut self.c64.board.iec, cycles as u32);
+            }
+            if let Some(d) = self.real_drive.as_mut() {
                 d.tick(&mut self.c64.board.iec, cycles as u32);
             }
         }
@@ -233,6 +328,9 @@ impl Harness {
             while self.c64.cpu.cycles < deadline {
                 let cycles = self.c64.step();
                 if let Some(d) = self.drive.as_mut() {
+                    d.tick(&mut self.c64.board.iec, cycles as u32);
+                }
+                if let Some(d) = self.real_drive.as_mut() {
                     d.tick(&mut self.c64.board.iec, cycles as u32);
                 }
                 if watch(&self.c64) {
