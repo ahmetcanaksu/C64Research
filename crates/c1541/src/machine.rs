@@ -75,17 +75,40 @@ impl Board {
     /// them.
     ///
     /// Port B bit assignments: PB0 DATA-in, PB2 CLK-in, PB7 ATN-in, PB5-6 the
-    /// device-address jumpers. DATA and CLK read the line level directly (1 =
-    /// released/high); **ATN is inverted** on the 1541, so PB7 (and CA1) read 1
-    /// while ATN is asserted. The DOS wires ATN to CA1 with PCR=$01 (rising
-    /// edge), so the drive takes an interrupt the instant the C64 asserts ATN.
+    /// device-address jumpers.
+    ///
+    /// **All three serial inputs are inverted** — they reach the VIA through
+    /// inverting buffers, so a `1` means the line is *pulled low*, not high.
+    /// The DOS's own bit-receive loop proves it for DATA:
+    ///
+    /// ```text
+    ///   EA0B:  LDA $1800
+    ///   EA0E:  EOR #$01     ; flip PB0 ...
+    ///   EA10:  LSR A        ; ... into the carry
+    ///   EA11:  AND #$02     ; (and isolate PB2, the clock)
+    ///   EA13:  BNE $EA0B    ; wait for the clock edge
+    ///   EA18:  ROR $85      ; the *flipped* PB0 is the data bit
+    /// ```
+    ///
+    /// A released DATA line means a one bit, and the DOS shifts in `NOT PB0` —
+    /// so `PB0 = 0` is a released line. The same loop pins CLK down: a listener
+    /// samples on the clock's *rising* edge, and this one leaves the wait when
+    /// PB2 is `0`, so `PB2 = 0` is CLK high.
+    ///
+    /// Model these the obvious way round instead and everything still boots and
+    /// still acknowledges attention — it just deadlocks halfway through the
+    /// first byte, with each side waiting for a line the other thinks it already
+    /// released.
+    ///
+    /// The DOS wires ATN to CA1 with PCR=$01 (rising edge), so the drive takes
+    /// an interrupt the instant the C64 asserts ATN.
     pub fn sync_bus_in(&mut self, bus: &iec::Bus) {
         let mut pb = 0xFF;
-        if !bus.data() {
-            pb &= !0x01; // DATA pulled low -> PB0 = 0
+        if bus.data() {
+            pb &= !0x01; // DATA released -> inverted PB0 = 0
         }
-        if !bus.clk() {
-            pb &= !0x04; // CLK pulled low -> PB2 = 0
+        if bus.clk() {
+            pb &= !0x04; // CLK released -> inverted PB2 = 0
         }
         if bus.atn() {
             pb &= !0x80; // ATN released -> inverted PB7 = 0
@@ -98,11 +121,27 @@ impl Board {
 
     /// Push VIA1's outputs onto the bus after the CPU has run.
     ///
-    /// PB1/PB3 are the DOS's DATA/CLK outputs (1 = pull the line low), and PB4
-    /// is ATNA. The attention acknowledge is **hardware**: a gate pulls DATA low
-    /// whenever ATNA disagrees with the ATN line, so a drive answers attention
-    /// in nanoseconds — before its CPU runs — wired-OR with the DOS's own DATA
-    /// output.
+    /// PB1 and PB3 are the DOS's DATA and CLK outputs (1 = pull the line low).
+    /// PB4 is **ATNA**, and it feeds a gate on the drive's board that also pulls
+    /// DATA low — wired-OR with PB1.
+    ///
+    /// The gate pulls DATA low whenever **ATNA disagrees with ATN**, which is
+    /// what makes a drive answer attention before its CPU has run. The DOS's
+    /// handler then takes the hold over in software and hands it back:
+    ///
+    /// ```text
+    ///   E870:  JSR $E9A5     ; PB1 = 1  -- pull DATA low in *software*
+    ///   E873:  ORA #$10      ; ATNA = 1 -- and hand the hold to the gate
+    ///   ...
+    ///   E9D7:  JSR $E99C     ; PB1 = 0  -- release the software hold
+    ///   E9DC:  JMP $FF20     ; then WAIT for DATA to read low
+    /// ```
+    ///
+    /// Read that with the inverted inputs of [`Board::sync_bus_in`] in mind and
+    /// it fits: setting ATNA makes the gate agree with ATN and stop pulling, PB1
+    /// keeps the line down meanwhile, and the `$FF20` wait is the DOS confirming
+    /// that letting go of PB1 really did release the line before it starts
+    /// clocking bits in.
     pub fn sync_bus_out(&self, bus: &mut iec::Bus, slot: usize) {
         let pb = self.via1.port_b();
         let mut pulls = 0;
@@ -115,7 +154,7 @@ impl Board {
         let atna = pb & 0x10 != 0;
         let atn_asserted = !bus.atn();
         if atna != atn_asserted {
-            pulls |= iec::line::DATA; // hardware ATN acknowledge
+            pulls |= iec::line::DATA;
         }
         bus.set_pulls(slot, pulls);
     }
@@ -291,6 +330,64 @@ mod tests {
     /// releases DATA at idle, and pulls DATA low the moment the controller
     /// asserts attention — the hardware acknowledge plus the DOS taking its CA1
     /// interrupt.
+    /// The DOS seeks the head to the track a job asks for.
+    ///
+    /// The dispatcher at `$F326` only seeks when it *knows* where the head is:
+    /// it reads the current track from `$22`, and a zero there means "unknown",
+    /// so it skips the seek entirely. At power-up `$22` is zero — which is why
+    /// the read test above can post a raw job and have it read whatever track
+    /// the head happens to be on. Tell the DOS where the head is and it steps.
+    ///
+    /// This is the test that pins the stepper *direction* down. Get it backwards
+    /// and the head walks to the rim stop and sits there, so a seek from 1 to 18
+    /// converging is the proof.
+    #[test]
+    fn dos_seeks_the_head_to_the_track_a_job_asks_for() {
+        let mut drive = Machine::new();
+        boot(&mut drive);
+
+        let image = d64::Disk::new(d64::fixtures::synthetic_image()).unwrap();
+        let id = image.id();
+        drive.insert_disk(Disk::from_d64(&image));
+
+        // Head parked on track 1, and the DOS believes it ($22).
+        drive.board.disk.seek(1);
+        drive.board.ram[0x22] = 1;
+        // Master ID, as an initialised drive would have (see the read test).
+        drive.board.ram[0x12] = id[0];
+        drive.board.ram[0x13] = id[1];
+
+        // Ask buffer 1 for track 18 sector 0 — seventeen tracks inward.
+        drive.board.ram[0x08] = 18;
+        drive.board.ram[0x09] = 0;
+        drive.board.ram[0x01] = 0x80; // READ
+
+        let mut code = 0x80u8;
+        let mut min_track = 1u8;
+        let mut max_track = 1u8;
+        for _ in 0..20_000_000u64 {
+            drive.step();
+            let t = drive.board.disk.track();
+            min_track = min_track.min(t);
+            max_track = max_track.max(t);
+            code = drive.board.ram[0x01];
+            if code < 0x80 {
+                break;
+            }
+        }
+
+        assert_eq!(
+            drive.board.disk.track(),
+            18,
+            "head ended on track {} (ranged {min_track}..={max_track}) — \
+             if it stuck at 1 the stepper is going the wrong way",
+            drive.board.disk.track()
+        );
+        assert_eq!(code, 0x01, "read job returned error code ${code:02X}");
+        assert_eq!(drive.board.ram[0x0400], 18, "BAM link track");
+        assert_eq!(drive.board.ram[0x0402], b'A', "BAM DOS version byte");
+    }
+
     #[test]
     fn drive_answers_attention_on_the_bus() {
         let mut drive = Machine::new();

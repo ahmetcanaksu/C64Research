@@ -123,6 +123,17 @@ impl Controller {
         self.half_track / 2 + 1
     }
 
+    /// True while the head sits over a sync mark (what drives VIA2 PB7 low).
+    pub fn syncing(&self) -> bool {
+        self.sync
+    }
+
+    /// Byte index of the head within the current track — a rotation counter,
+    /// useful only for showing that the disk is actually turning.
+    pub fn head_pos(&self) -> usize {
+        self.pos
+    }
+
     /// Force the head onto a whole track, bypassing a stepper seek. For tests
     /// and for tools that want to read a known track without waiting for the DOS
     /// to bump and seek.
@@ -146,21 +157,27 @@ impl Controller {
         let pb = via2.port_b();
         let motor_on = pb & 0x04 != 0;
 
-        // Stepper: rotating the two phase bits by one moves the head a half-track
-        // — up a phase steps toward the centre (higher tracks), down toward the
-        // rim. The DOS seeks by pulsing these; it learns where it landed by
-        // reading a sector header, so it is a closed loop as long as a step of
-        // "+1 phase" reliably means "+1 half-track".
+        // Stepper: rotating the two phase bits by one moves the head a half-track.
+        //
+        // Which way round is not a matter of taste — the DOS decides it, and the
+        // ROM says so plainly. `$F326` computes the seek distance as
+        // `current_track - wanted_track` (`$22` minus the job's track), then
+        // complements it into `$4A` as a signed half-track count; `$FA2E`
+        // branches on that sign and **increments** the phase (`INX`) when it is
+        // positive. Seeking from track 1 to track 18 leaves `$4A` positive, so:
+        //
+        //   phase + 1  =>  inward, toward higher track numbers (the disk centre)
+        //   phase - 1  =>  outward, toward the rim
+        //
+        // Get this backwards and a seek walks into the rim stop and stays there,
+        // which looks exactly like a head that never moved.
         let phase = pb & 0x03;
         if phase != self.last_phase {
-            // The DOS steps *inward* (toward higher track numbers, the disk
-            // centre) by decrementing the phase, and toward the rim by
-            // incrementing it — so phase-1 raises the track, phase+1 lowers it.
-            if phase == (self.last_phase + 3) & 3 {
+            if phase == (self.last_phase + 1) & 3 {
                 if self.half_track < (TRACKS - 1) * 2 {
                     self.half_track += 1;
                 }
-            } else if phase == (self.last_phase + 1) & 3 && self.half_track > 0 {
+            } else if phase == (self.last_phase + 3) & 3 && self.half_track > 0 {
                 self.half_track -= 1;
             }
             self.last_phase = phase;
@@ -289,15 +306,16 @@ mod tests {
     fn stepper_moves_the_head_a_half_track_per_phase() {
         let (mut ctrl, mut via2) = drive_on_track(1);
         assert_eq!(ctrl.track(), 1);
-        // Stepping inward (toward higher tracks) decrements the phase; four
-        // half-steps in = two whole tracks.
-        for phase in [3u8, 2, 1, 0] {
+        // Inward (toward higher tracks) is a phase *increment* — the direction
+        // the DOS's own seek arithmetic implies; see `tick`. Four half-steps in
+        // is two whole tracks.
+        for phase in [1u8, 2, 3, 0] {
             via2.write(0x00, 0x04 | phase); // keep motor on, set stepper phase
             ctrl.tick(&mut via2, 4);
         }
         assert_eq!(ctrl.track(), 3, "four half-steps in should reach track 3");
-        // And back out toward the rim by incrementing the phase.
-        for phase in [1u8, 2, 3, 0] {
+        // And back out toward the rim by decrementing it.
+        for phase in [3u8, 2, 1, 0] {
             via2.write(0x00, 0x04 | phase);
             ctrl.tick(&mut via2, 4);
         }
