@@ -165,6 +165,20 @@ impl Vic {
         if y >= HEIGHT {
             return;
         }
+        // DEN ($D011 bit 4) — the display enable. Clear it and the VIC stops
+        // fetching graphics altogether and shows nothing but border colour
+        // across the whole window; sprites go with it, and so do collisions,
+        // because the sequencers that would notice them never run.
+        //
+        // Games blank the screen exactly when the picture would be ugly — while
+        // they rebuild a level, or unpack graphics — so ignoring DEN means
+        // showing the viewer a frame of half-built rubbish that a real C64 hides.
+        if self.regs[0x11] & 0x10 == 0 {
+            let border = rgb(self.regs[0x20]);
+            fb[y * WIDTH..(y + 1) * WIDTH].fill(border);
+            return;
+        }
+
         // Which pixels on this line are *foreground* graphics.
         //
         // This is what a sprite has to touch to register a background collision,
@@ -452,6 +466,7 @@ mod tests {
     #[test]
     fn renders_a_hires_character() {
         let mut vic = Vic::new();
+        vic.write(0x11, 0x1B); // DEN — without it the VIC draws only border
         vic.write(0x18, 0x14); // screen $0400, chars $1000 (char ROM)
         vic.write(0x21, 0x06); // blue background
         let mut ram = [0u8; 0x10000];
@@ -469,7 +484,7 @@ mod tests {
     #[test]
     fn renders_standard_bitmap() {
         let mut vic = Vic::new();
-        vic.write(0x11, 0x20); // BMM on (bitmap mode)
+        vic.write(0x11, 0x30); // BMM on (bitmap mode) + DEN (display enabled)
         vic.write(0x18, 0x18); // video matrix $0400, bitmap $2000
         let mut ram = [0u8; 0x10000];
         // First bitmap byte: alternating pixels; colours from the video matrix.
@@ -485,7 +500,7 @@ mod tests {
     #[test]
     fn renders_multicolor_bitmap() {
         let mut vic = Vic::new();
-        vic.write(0x11, 0x20); // BMM
+        vic.write(0x11, 0x30); // BMM + DEN
         vic.write(0x16, 0x10); // MCM -> multicolor bitmap
         vic.write(0x18, 0x18); // video $0400, bitmap $2000
         vic.write(0x21, 0x00); // background (bit-pair 00) = black
@@ -516,6 +531,10 @@ mod tests {
     impl Scene {
         fn new() -> Self {
             let mut vic = Vic::new();
+            // $1B is what the KERNAL's CINT writes: display enabled, 25 rows.
+            // Without DEN the VIC draws nothing but border, which is correct and
+            // makes every render assertion below vacuous.
+            vic.write(0x11, 0x1B);
             vic.write(0x18, 0x14); // video matrix $0400, char data $1000 (char ROM)
             let mut ram = [0u8; 0x10000];
             // A screen of spaces, so the background has no foreground pixels.
@@ -543,6 +562,41 @@ mod tests {
         fn render(&mut self, y: usize) {
             self.vic.render_line(y, &self.ram, &self.char_rom, 0x07, &mut self.fb);
         }
+    }
+
+    /// A blanked screen (DEN clear) shows border colour and nothing else — not
+    /// the graphics that happen to still be in memory.
+    #[test]
+    fn display_disable_blanks_the_whole_line() {
+        let mut s = Scene::new();
+        s.vic.write(0x20, 0x02); // border red
+        // Something that would definitely be visible if we drew it.
+        s.ram[0x0400] = 0x01;
+        s.char_rom[0x08] = 0xFF;
+        s.place(0, 0, 0);
+
+        // Screen on: the line is not uniformly border colour.
+        s.vic.write(0x11, 0x1B); // DEN set
+        s.render(0);
+        assert!(
+            s.fb[..WIDTH].iter().any(|&p| p != PALETTE[2]),
+            "with DEN set the display should be drawn"
+        );
+
+        // Clear the collisions the visible render just latched, so the check
+        // below is about the blanked frame and not that one.
+        let _ = s.vic.read(0x1E);
+        let _ = s.vic.read(0x1F);
+
+        // Screen off: nothing but border, sprite included.
+        s.vic.write(0x11, 0x0B); // DEN clear
+        s.render(0);
+        assert!(
+            s.fb[..WIDTH].iter().all(|&p| p == PALETTE[2]),
+            "with DEN clear the whole line should be border colour"
+        );
+        assert_eq!(s.vic.read(0x1E), 0, "a blanked screen detects no collisions");
+        assert_eq!(s.vic.read(0x1F), 0);
     }
 
     #[test]
@@ -651,6 +705,7 @@ mod tests {
     #[test]
     fn renders_a_sprite_pixel() {
         let mut vic = Vic::new();
+        vic.write(0x11, 0x1B); // DEN — without it the VIC draws only border
         vic.write(0x18, 0x14); // video matrix at $0400 (so pointers are at $07F8)
         vic.write(0x15, 0x01); // enable sprite 0
         vic.write(0x27, 0x02); // sprite 0 red
@@ -670,6 +725,7 @@ mod tests {
     fn sprite_background_priority_hides_the_sprite() {
         // A foreground character pixel at (0,0), and a red sprite over it.
         let mut vic = Vic::new();
+        vic.write(0x11, 0x1B); // DEN — without it the VIC draws only border
         vic.write(0x18, 0x14); // screen $0400, chars = ROM
         vic.write(0x21, 0x06); // blue background
         vic.write(0x15, 0x01); // sprite 0 on
