@@ -185,6 +185,44 @@ collision interrupts permanently.
 **In multicolour modes, bit pair `%01` draws a colour but is not foreground.** So
 a sprite passes through it with no collision.
 
+**DEN (`$D011` bit 4) blanks the display to border colour.** Clear it and the VIC
+fetches no graphics at all — no characters, no bitmap, no sprites, no collisions.
+Games blank the screen precisely when the picture would be ugly (rebuilding a
+level, unpacking graphics), so a renderer that ignores DEN shows the viewer a
+frame of half-built rubbish that a real C64 hides — which then reads as "the
+emulator is drawing garbage" when it is really the *game* saying "don't look".
+Note the corollary for tests: `Vic::new()` starts with `$D011 = 0`, so any render
+test has to set DEN itself (the KERNAL's CINT writes `$1B`) or it asserts against
+a blank screen.
+
+**All three of the 1541's serial inputs are inverted.** VIA1 PB0 (DATA), PB2
+(CLK) and PB7 (ATN) reach the chip through inverting buffers, so a `1` means the
+line is *pulled low*. The DOS's bit-receive loop proves it:
+
+```text
+  EA0B:  LDA $1800
+  EA0E:  EOR #$01     ; flip PB0 ...
+  EA10:  LSR A        ; ... into the carry
+  EA11:  AND #$02     ; (and isolate PB2, the clock)
+  EA13:  BNE $EA0B    ; wait for the clock edge
+  EA18:  ROR $85      ; the *flipped* PB0 is the data bit
+```
+
+A released DATA line is a one bit and the DOS shifts in `NOT PB0`, so `PB0 = 0`
+is a released line; the same loop exits its clock wait when `PB2 = 0`, so that is
+CLK high. Note this is the **opposite** of the C64's side, where CIA2's inputs
+are *not* inverted — the two ends of the same three wires disagree, which is
+exactly the sort of thing to get wrong once. Model these the obvious way round
+and the drive still boots and still acknowledges attention; it just deadlocks
+partway through the first byte with each side waiting on a line the other thinks
+it released.
+
+**The drive's ATN acknowledge is a gate, then software.** DATA is pulled low
+whenever ATNA (PB4) disagrees with ATN — that is the instant, CPU-less answer to
+attention. The DOS's handler then pulls DATA in software (`$E870`, PB1) *before*
+setting ATNA (`$E873`), so the hold passes from the gate to the DOS; later it
+releases PB1 and spins at `$FF20` until the line really does read high again.
+
 **The 1541's BYTE-READY is the CPU's SO pin, not an interrupt.** The drive reads a
 GCR byte with `BVC *` / `CLV` / `LDA $1C01` (see `$F53D`): the read head's
 byte-ready line is wired to the 6502 SO pin, which sets V asynchronously. So the
@@ -198,11 +236,22 @@ Model: PB7 low while over two consecutive `$FF`, and no byte-ready pulse there.
 Miss this and the DOS reads sync bytes as data. The DOS finds sync with a
 timeout (`$F556` arms VIA1 T1), so *no* sync marks → error 21, not a hang.
 
-**The stepper steps inward on phase decrement.** Rotating VIA2 PB0-1 down one
-(`(phase-1)&3`) moves the head toward higher track numbers (disk centre), up one
-toward the rim. Get it backwards and a seek from track 1 to 18 just bumps the rim
-stop forever. A raw `$80` READ job does **not** seek — it reads whatever track the
-head is on; the DOS's file layer seeks first through a separate path.
+**The stepper steps inward on phase _increment_.** Rotating VIA2 PB0-1 *up* one
+(`(phase+1)&3`) moves the head toward higher track numbers (disk centre), down one
+toward the rim. The ROM settles it: `$F326` computes `current_track - wanted_track`
+(`$22` minus the job's track) and complements it into `$4A` as a signed half-track
+count, then `$FA2E` **increments** the phase when `$4A` is positive — and a seek
+from 1 to 18 leaves it positive. Get it backwards and the head walks into the rim
+stop and stays there, which looks exactly like a head that never moved.
+
+**A READ job _does_ seek — unless `$22` is zero.** `$F328` treats a zero
+current-track as "position unknown" and skips the seek, and `$22` is zero at
+power-up. So a raw job posted to a freshly booted drive reads whatever track the
+head is on; set `$22` to where the head actually is and the DOS steps there
+itself. That is what
+`c1541::machine::tests::dos_seeks_the_head_to_the_track_a_job_asks_for` does, and
+it is the only test that constrains the stepper direction — the unit test in
+`disk.rs` only checks the model against its own convention.
 
 **A sector header stores its two ID bytes reversed from the BAM.** `gcr` writes
 them `[id[1], id[0]]`; the DOS reads them back into `$16/$17` in disk order
@@ -240,29 +289,32 @@ to pick it up cold.
 
 ### Current state — pick up here (2026-09-07)
 
-The big item, "put the real 1541 firmware on the serial bus," is **most of the
-way done**. Sub-items 1a (VIA1 → bus), 1b (VIA2 → disk controller,
-`crates/c1541/src/disk.rs`) and 1c (GCR track synthesis, `crates/gcr`) are all
-built, tested and committed on branch `serial-bus-and-harness`. The booted 1541
-DOS reads a real sector off an emulated GCR disk through its own job queue —
-verified by `c1541::machine::tests::dos_reads_a_sector_through_its_job_queue`. See
-the four new disk gotchas above (SO pin, sync suppression, stepper direction, ID
-order) before touching `disk.rs`.
+The big item, **"put the real 1541 firmware on the serial bus," is done.** With
+the virtual `iec::Device` unplugged, a C64 and a whole emulated 1541 sit on one
+`iec::Bus` and `LOAD"$",8` / `LOAD"*",8,1` work end to end: two 6502s handshaking
+over three wires, the DOS bumping and seeking its head, finding a sync mark,
+decoding GCR, and shipping bytes up the bus. Nothing host-side answers for it.
+See `crates/harness/tests/real_drive.rs`, and `apps/emu --real-drive`.
 
-**Next, in order** (also in the roadmap §1 progress block):
+Three bugs were found getting there, all now fixed and all worth knowing about
+(they are in the gotchas above): the **stepper direction** was inverted, and both
+the **serial input polarity** and the resulting **ATNA gate** were wrong. Each
+failed silently in a different way — a head that never moved, a `DEVICE NOT
+PRESENT`, and a mid-byte deadlock.
 
-1. **Seek during a job.** The raw `$80` READ job reads whatever track the head is
-   on; the test pre-positions it with `board.disk.seek(18)`. The DOS's *file*
-   layer seeks separately — confirm that path drives the stepper and a seek from
-   track 1 to 18 converges (direction was flipped once; `disk.rs` steps inward on
-   phase **decrement**).
-2. **The real end-to-end test.** `LOAD"$",8` then `LOAD"*",8,1` from a C64 on the
-   same bus with the *virtual* `iec::Device` unplugged — served entirely by the
-   firmware + this disk controller. Wire a `c1541::Machine` into `apps/emu`
-   alongside the C64 and clock both on one `iec::Bus` (drive via
-   `Machine::step_on_bus`).
-3. **Status UI.** Add a **Drive** panel to `apps/emu --status`: current track,
-   motor/LED, SYNC, head activity. (Explicitly requested; not yet done.)
+The **DRIVE panel** in `apps/emu --status` is done too — track, motor, LED, SYNC,
+the drive's PC, and a spinner that only turns while the head index is moving, so
+a stalled drive looks stalled.
+
+**Next, in order:**
+
+1. **Two drives on one bus.** `iec::MAX_DEVICES` is 4 and the address jumpers are
+   modelled (`DEVICE_8_JUMPERS`), but nothing has ever exercised device 9.
+2. **`SAVE`** — roadmap §2. The real drive makes this more interesting: writing
+   means GCR *encoding* on the fly and a write-protect sense that means something.
+3. **Drive timing.** The `cycles_per_byte` figures in `disk.rs` are floors, not
+   measurements, and the whole transfer runs faster than a real 1541. Fine for the
+   DOS; not enough for a fast loader that counts cycles.
 
 Timing is floors, not measured — a fast loader counting cycles won't work yet.
 `.scratch/` (gitignored) holds a disasm dump; keep temp files inside the project,

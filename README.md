@@ -39,8 +39,10 @@ actually works* — or build one — this is for you.
 - **VIC-II video** — text, multicolor, bitmap and multicolor-bitmap modes, 8
   sprites, and **raster interrupts**, rendered per-scanline.
 - **SID sound** — 3 voices with ADSR envelopes, played through `cpal`.
-- **A working 1541 disk drive** — the real drive firmware boots to its DOS idle
-  loop (its own 6502 + two VIA chips).
+- **A working 1541 disk drive** — and not just booting: with `--real-drive` the
+  genuine DOS ROM serves a `LOAD` end to end. Two 6502s handshake over three
+  wires while the DOS bumps and seeks its head, finds a sync mark and decodes GCR
+  off a rotating disk. Nothing host-side answers for it.
 - **The serial (IEC) bus** — three open-collector lines shared wired-OR, with
   CIA2 wired in and a device that speaks the real protocol. `LOAD"$",8` and
   `LOAD"*",8,1` work through the **genuine KERNAL**, a bit at a time, EOI and
@@ -77,6 +79,7 @@ C64_REQUIRE_ROMS=1 cargo test                # ...and fail rather than skip if R
 cargo run -p emu --release                   # boot to the READY. prompt
 cargo run -p emu --release -- game.prg       # boot + load + RUN a program
 cargo run -p emu --release -- disk.d64       # attach a drive, LOAD over the bus
+cargo run -p emu --release -- disk.d64 --real-drive  # ...served by the real 1541 firmware
 cargo run -p emu --release -- disk.d64 NAME  # ...and ask for a specific file
 cargo run -p emu --release -- disk.d64 --sideload   # skip the bus, inject the bytes
 cargo run -p emu --release -- cart.bin       # plug in a cartridge and reset

@@ -14,11 +14,11 @@ something that does. "Make more software run" is not on its own a reason.
 
 | | |
 |---|---|
-| Tests | 147 passing, 0 failing, 1 loud skip (needs a non-redistributable `.prg`) |
+| Tests | 154 passing, 0 failing, 1 loud skip (needs a non-redistributable `.prg`) |
 | `cargo clippy --all-targets` | clean — keep it that way |
 | Boots | real KERNAL + BASIC to `READY.`; real 1541 DOS to its idle loop |
 | Loads | `.prg` (side-load), `.d64` over the emulated serial bus, 8K/16K cartridges |
-| Drive | real 1541 on the bus (VIA1), and its DOS reads a real sector off a synthesised GCR disk through the disk controller (VIA2) — see roadmap §1 |
+| Drive | **real 1541 on the bus, serving `LOAD` end to end** — its own 6502 running the DOS ROM, reading a synthesised GCR disk through the disk controller. `apps/emu --real-drive` |
 
 ---
 
@@ -47,7 +47,7 @@ something that does. "Make more software run" is not on its own a reason.
 
 ## Next
 
-### 1. Put the real 1541 firmware on the bus
+### 1. Put the real 1541 firmware on the bus — ✅ done
 
 **The headline item.** `crates/c1541` already boots the genuine DOS ROM into its
 idle loop, and `crates/iec` already carries bytes between a C64 and a device. The
@@ -61,30 +61,33 @@ over three wires, with no host-side shortcut anywhere in the path.
 There are three separable pieces. Do them in this order; each is independently
 verifiable.
 
-> **Progress (2026-09-07).** 1a, 1b and 1c are **built and unit-tested**. The
-> booted DOS now reads a real sector off an emulated disk through its own job
-> queue — rotating GCR disk → sync detection → BYTE-READY on the CPU's SO pin →
-> header match → GCR data decode — verified end-to-end in
-> `c1541::machine::tests::dos_reads_a_sector_through_its_job_queue`.
+> **Done (2026-09-07).** 1a, 1b and 1c are built, and the whole thing works end
+> to end: with the virtual `iec::Device` unplugged, `LOAD"$",8` and
+> `LOAD"*",8,1` are served entirely by the firmware — see
+> `crates/harness/tests/real_drive.rs` and `apps/emu --real-drive`.
 >
-> **What's left to make it whole (start here next):**
-> 1. **Seek during a job.** The raw `$80` READ job reads whatever track the head
->    is already on; the test pre-positions the head with `board.disk.seek(18)`.
->    The DOS's *file* layer seeks separately — confirm that path drives the
->    stepper the right way (direction was flipped once already; `disk.rs` steps
->    inward on phase **decrement**). A seek that converges from track 1 to 18 is
->    the proof.
-> 2. **The real end-to-end test.** `LOAD"$",8` (then `LOAD"*",8,1`) from a C64 on
->    the same bus with the *virtual* `iec::Device` unplugged — served entirely by
->    the firmware + this disk controller. Wire a `c1541::Machine` into `apps/emu`
->    alongside the C64 and clock both on one `iec::Bus` (the drive via
->    `Machine::step_on_bus`).
-> 3. **Status UI.** Add a **Drive** panel to `apps/emu --status`: current track,
->    motor/LED, SYNC, head activity. (Requested; not yet done.)
-> 4. **ID order.** Sector headers store the two ID bytes as `[id[1], id[0]]`; the
->    DOS reads them into `$16/$17` in disk order `[id[0], id[1]]` and checks them
->    against the master ID at `$12/$13` (per drive, indexed by `$3E`). A raw job
->    needs that master ID pre-loaded (a real access initialises it from the BAM).
+> Three bugs stood in the way, each failing silently in its own way:
+>
+> 1. **The stepper direction was inverted.** `$F326` computes the seek distance
+>    as `current - wanted` and `$FA2E` increments the phase when the result is
+>    positive, so *inward* (higher track numbers) is a phase **increment**. Wrong
+>    way round, the head walks into the rim stop and looks like it never moved.
+>    Also learned here: a READ job *does* seek, but `$F328` skips it when `$22`
+>    (current track) is zero — which it is at power-up.
+> 2. **All three serial inputs are inverted** (VIA1 PB0/PB2/PB7), the opposite of
+>    the C64's CIA2 side. The DOS's own bit loop at `$EA0B` shifts in `NOT PB0`,
+>    which settles it.
+> 3. **The ATNA gate** followed from (2): DATA is pulled when ATNA disagrees with
+>    ATN, with the DOS taking the hold over in software across the handover.
+>
+> The `apps/emu --status` monitor grew a **DRIVE** panel to match: track, motor,
+> LED, SYNC, the drive's PC, and a spinner driven off the head index so a stalled
+> drive is visibly stalled.
+>
+> **What's left:** a second drive on the bus (device 9 is modelled via the address
+> jumpers but never exercised); `SAVE`, which now means GCR encoding on the fly;
+> and real drive timing — `cycles_per_byte` is a floor, so a fast loader that
+> counts cycles still has nothing to count.
 
 #### 1a. VIA1 → the serial bus (the drive's side of the handshake) — ✅ done
 
