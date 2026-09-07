@@ -20,7 +20,29 @@ const DIM: u32 = 0x1C_7A3C; // dim green for labels
 const HOT: u32 = 0xFF_C24B; // amber for anything currently active
 
 /// The monitor's framebuffer plus a little activity-tracking state.
+/// A snapshot of the mechanism inside a real 1541, for the DRIVE panel.
+///
+/// Deliberately plain data rather than a borrow of the drive: the monitor should
+/// be able to draw a picture of the hardware without knowing what a `c1541` is.
+#[derive(Default, Clone, Copy)]
+pub struct DriveState {
+    /// Whole track the head is over (1..=35).
+    pub track: u8,
+    /// Spindle motor running (VIA2 PB2).
+    pub motor: bool,
+    /// Activity LED lit (VIA2 PB3) — the light you watch on a real drive.
+    pub led: bool,
+    /// Head is over a sync mark (a run of one-bits between sectors).
+    pub sync: bool,
+    /// Byte index of the head within the track: proof the disk is turning.
+    pub head: usize,
+    /// The drive CPU's program counter.
+    pub pc: u16,
+}
+
 pub struct Monitor {
+    /// Head position last frame, to tell a turning disk from a stalled one.
+    last_head: usize,
     fb: Vec<u32>,
     last_bus: (bool, bool, bool),
     bus_active_until: u32,
@@ -32,6 +54,7 @@ impl Default for Monitor {
             fb: vec![BG; WIDTH * HEIGHT],
             last_bus: (true, true, true),
             bus_active_until: 0,
+            last_head: usize::MAX,
         }
     }
 }
@@ -46,7 +69,13 @@ impl Monitor {
     }
 
     /// Redraw the dashboard from the machine's current state.
-    pub fn render(&mut self, c64: &C64, drive_attached: bool, frames: u32) {
+    pub fn render(
+        &mut self,
+        c64: &C64,
+        drive_attached: bool,
+        drive: Option<DriveState>,
+        frames: u32,
+    ) {
         for px in self.fb.iter_mut() {
             *px = BG;
         }
@@ -169,6 +198,47 @@ impl Monitor {
             if bus_busy { HOT } else { DIM },
         );
 
+        // ---- the drive's own mechanism, when the real firmware is attached ----
+        if let Some(d) = drive {
+            // The head index only advances while the disk turns, so comparing it
+            // with last frame's is a direct read on "is this thing spinning".
+            let turning = d.head != self.last_head;
+            self.last_head = d.head;
+
+            self.put(c64, 0, 15, "1541", HOT);
+            fn flag(on: bool, s: &'static str) -> &'static str {
+                if on {
+                    s
+                } else {
+                    "-"
+                }
+            }
+            self.put(
+                c64,
+                5,
+                15,
+                &format!(
+                    "TRK:{:02} {} {} {} PC:{:04X}",
+                    d.track,
+                    flag(d.motor, "MOTOR"),
+                    flag(d.led, "LED"),
+                    flag(d.sync, "SYNC"),
+                    d.pc
+                ),
+                if d.motor { HOT } else { FG },
+            );
+            // A four-phase spinner, stepped by the head index: it turns only when
+            // the disk does, so a stalled drive is obvious at a glance.
+            let spin = ['|', '/', '-', '\\'][(d.head / 8) % 4];
+            self.put(
+                c64,
+                36,
+                15,
+                &if turning { spin.to_string() } else { ".".to_string() },
+                if turning { HOT } else { DIM },
+            );
+        }
+
         // ---- cassette (not emulated, but the port bits are real) ----
         let p01 = c64.board.port01();
         self.put(c64, 0, 16, "TAPE", HOT);
@@ -228,5 +298,76 @@ fn screencode(c: u8) -> u8 {
         b'a'..=b'z' => c - 0x60,
         0x20..=0x3F => c, // space, digits, punctuation coincide with ASCII
         _ => 0x20,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn machine() -> Option<Box<C64>> {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../roms/");
+        let rd = |n: &str| std::fs::read(format!("{dir}{n}")).ok();
+        let (k, b, c) = (
+            rd("kernal-901227-03.bin")?,
+            rd("basic-901226-01.bin")?,
+            rd("chargen-901225-01.bin")?,
+        );
+        Some(Box::new(C64::new(&k, &b, &c)))
+    }
+
+    /// How many pixels of one character row are lit.
+    fn lit(mon: &Monitor, row: usize) -> usize {
+        let fb = mon.framebuffer();
+        (row * 8..row * 8 + 8)
+            .flat_map(|y| (0..WIDTH).map(move |x| (x, y)))
+            .filter(|&(x, y)| fb[y * WIDTH + x] != BG)
+            .count()
+    }
+
+    /// The DRIVE panel only appears when a real drive is attached, and it draws
+    /// something when it does. Row 15 is its line.
+    #[test]
+    fn drive_panel_appears_only_with_a_real_drive() {
+        let Some(c64) = machine() else {
+            eprintln!("SKIP drive_panel_appears_only_with_a_real_drive: C64 ROMs missing");
+            return;
+        };
+
+        let mut mon = Monitor::new();
+        mon.render(&c64, false, None, 0);
+        assert_eq!(lit(&mon, 15), 0, "no drive attached: row 15 should be blank");
+
+        let state = DriveState {
+            track: 18,
+            motor: true,
+            led: true,
+            sync: false,
+            head: 64,
+            pc: 0xF556,
+        };
+        mon.render(&c64, true, Some(state), 1);
+        assert!(lit(&mon, 15) > 0, "the DRIVE panel should have drawn");
+    }
+
+    /// The spinner only turns while the head index is moving, so a stalled drive
+    /// is visibly stalled rather than looking busy.
+    #[test]
+    fn the_spinner_tracks_a_turning_disk() {
+        let Some(c64) = machine() else {
+            eprintln!("SKIP the_spinner_tracks_a_turning_disk: C64 ROMs missing");
+            return;
+        };
+        let mut mon = Monitor::new();
+        let at = |head| DriveState { track: 18, motor: true, led: false, sync: false, head, pc: 0 };
+
+        // Two frames at the same head position: the second is "not turning".
+        mon.render(&c64, true, Some(at(10)), 0);
+        mon.render(&c64, true, Some(at(10)), 1);
+        let stalled = lit(&mon, 15);
+        // Now move the head.
+        mon.render(&c64, true, Some(at(50)), 2);
+        let turning = lit(&mon, 15);
+        assert_ne!(stalled, turning, "the spinner should change when the disk turns");
     }
 }

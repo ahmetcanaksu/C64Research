@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use c64::C64;
 use harness::keyboard::{self, Typist, RUN_STOP_KEY, SHIFT_KEY};
-use harness::{screen, Drive, CYCLES_PER_FRAME};
+use harness::{screen, Drive, RealDrive, CYCLES_PER_FRAME};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use minifb::{InputCallback, Key, KeyRepeat, Scale, ScaleMode, Window, WindowOptions};
@@ -168,6 +168,9 @@ fn main() -> ExitCode {
     // A drive on the serial bus, if we attach one. Declared out here because the
     // frame loop below has to clock it alongside the CPU.
     let mut drive: Option<Drive> = None;
+    // ...or the genuine 1541 firmware instead, with `--real-drive`. Same bus,
+    // same wires; the difference is that nothing host-side answers for it.
+    let mut real_drive: Option<RealDrive> = None;
 
     if let Some(&path) = positional.first() {
         let name = positional.get(1).copied();
@@ -211,6 +214,23 @@ fn main() -> ExitCode {
                 .and_then(|b| d64::Disk::new(b).ok_or_else(|| "not a valid .d64 image".into()))
             {
                 Ok(disk) => {
+                    // Show what is actually on the disk. `*` picks the *first*
+                    // PRG, which on a multi-program disk is a coin toss — and a
+                    // silent one, which is how you end up staring at a black
+                    // screen wondering what broke. Name the file you want as the
+                    // second argument.
+                    let entries: Vec<_> = disk.dir().into_iter().filter(|e| e.is_prg()).collect();
+                    if entries.len() > 1 {
+                        println!("  contents  : {} programs —", entries.len());
+                        for (i, e) in entries.iter().enumerate() {
+                            let pick = if i == 0 && name.is_none() { " <- `*` picks this" } else { "" };
+                            println!("                \"{}\"  {} blocks{}", e.name, e.size_sectors, pick);
+                        }
+                        if name.is_none() {
+                            println!("                (pass a name to choose, e.g. -- disk.d64 \"NAME\")");
+                        }
+                    }
+
                     // Peek at the load address host-side, purely so we can print
                     // the right hint (RUN for BASIC, SYS for machine code).
                     let want = name.unwrap_or("*");
@@ -219,6 +239,22 @@ fn main() -> ExitCode {
                         .filter(|p| p.len() >= 2)
                         .map(|p| u16::from_le_bytes([p[0], p[1]]));
 
+                    if args.iter().any(|a| a == "--real-drive") {
+                        // Two 6502s on three wires: the DOS ROM does the talking
+                        // and reads a GCR disk through its own controller. Much
+                        // slower than the host-side device, and the head audibly
+                        // seeks — which is the point.
+                        let mut attached = RealDrive::new(disk);
+                        println!("  drive     : REAL 1541 firmware, device 8 <- {path}");
+                        run_until_ready_real(&mut c64, &mut attached);
+                        if !no_autoload {
+                            for ch in format!("load\"{want}\",8,1\r").chars() {
+                                type_queue.borrow_mut().push_back(ch);
+                            }
+                        }
+                        println!("  note      : the real drive is slow, as a 1541 is\n");
+                        real_drive = Some(attached);
+                    } else {
                     let mut attached = Drive::new(disk);
                     println!("  drive     : device 8 on the serial bus <- {path}");
                     run_until_ready(&mut c64, Some(&mut attached));
@@ -240,6 +276,7 @@ fn main() -> ExitCode {
                             println!("  loading   : LOAD\"{want}\",8,1  — then SYS {addr} to start\n")
                         }
                         None => println!("  loading   : LOAD\"{want}\",8,1\n"),
+                    }
                     }
                 }
                 Err(e) => eprintln!("  disk error : {e}\n"),
@@ -280,7 +317,7 @@ fn main() -> ExitCode {
             .and_then(|v| v.parse().ok())
             .unwrap_or(600);
 
-        if drive.is_none() {
+        if drive.is_none() && real_drive.is_none() {
             // Nothing queued a boot yet, so do it here.
             run_until_ready(&mut c64, None);
         }
@@ -299,6 +336,9 @@ fn main() -> ExitCode {
             while c64.cpu.cycles < deadline {
                 let cycles = c64.step();
                 if let Some(d) = drive.as_mut() {
+                    d.tick(&mut c64.board.iec, cycles as u32);
+                }
+                if let Some(d) = real_drive.as_mut() {
                     d.tick(&mut c64.board.iec, cycles as u32);
                 }
             }
@@ -506,6 +546,9 @@ fn main() -> ExitCode {
             if let Some(d) = drive.as_mut() {
                 d.tick(&mut c64.board.iec, c as u32);
             }
+            if let Some(d) = real_drive.as_mut() {
+                d.tick(&mut c64.board.iec, c as u32);
+            }
             if let Some(cps) = cycles_per_sample {
                 sample_carry += c as f32;
                 while sample_carry >= cps {
@@ -540,7 +583,20 @@ fn main() -> ExitCode {
         frame_count = frame_count.wrapping_add(1);
         if let Some((mon_win, mon)) = monitor.as_mut() {
             if mon_win.is_open() {
-                mon.render(&c64, drive.is_some(), frame_count);
+                let drive_state = real_drive.as_ref().map(|d| status::DriveState {
+                    track: d.track(),
+                    motor: d.motor_on(),
+                    led: d.led_on(),
+                    sync: d.syncing(),
+                    head: d.head_pos(),
+                    pc: d.pc(),
+                });
+                mon.render(
+                    &c64,
+                    drive.is_some() || real_drive.is_some(),
+                    drive_state,
+                    frame_count,
+                );
                 let _ = mon_win.update_with_buffer(mon.framebuffer(), status::WIDTH, status::HEIGHT);
             }
         }
@@ -605,6 +661,18 @@ fn load_program_file(path: &str, name: Option<&str>) -> Result<Vec<u8>, String> 
 
 /// Step the machine until the KERNAL prints READY. (so an injected program lands
 /// at the BASIC prompt). Bounded so a bad ROM can't hang forever.
+/// Boot the C64 with the real drive powered on beside it, both on one bus.
+fn run_until_ready_real(c64: &mut c64::C64, drive: &mut RealDrive) {
+    const READY: [u8; 5] = [0x12, 0x05, 0x01, 0x04, 0x19];
+    for i in 0..40_000_000u64 {
+        let cycles = c64.step();
+        drive.tick(&mut c64.board.iec, cycles as u32);
+        if i % 100_000 == 0 && c64.board.ram[0x0400..0x07E8].windows(5).any(|w| w == READY) {
+            return;
+        }
+    }
+}
+
 fn run_until_ready(c64: &mut c64::C64, mut drive: Option<&mut Drive>) {
     const READY: [u8; 5] = [0x12, 0x05, 0x01, 0x04, 0x19];
     for i in 0..40_000_000u64 {
